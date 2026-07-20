@@ -1,6 +1,9 @@
 //! Effect engine: turns beat events + intensity into 50 Hz light frames.
-//! Multi-band mapping: each band lights its palette slot color on the
-//! channels assigned to it (Sound2Light style).
+//!
+//! Position-aware multi-band mapping: entertainment-area channel positions
+//! (x = left/right, z = floor/ceiling, each -1..1) drive which band a light
+//! reacts to (kick at the floor, hats at the ceiling) and a left-to-right
+//! chase offset within a band group.
 
 use core_types::{Band, BandBeatEvent, Color, LightFrame, Palette};
 use serde::{Deserialize, Serialize};
@@ -22,6 +25,36 @@ pub enum Panic {
     Freeze,
 }
 
+/// How bands are routed to lights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BandAssignment {
+    /// Every light reacts to every band (LightBeat-style).
+    All,
+    /// Split lights by height: lowest lights take the low band, highest
+    /// take the high band. Uses entertainment-area positions.
+    ByHeight,
+    /// Explicit per-channel mapping via `channel_bands`.
+    Custom,
+}
+
+/// A light channel with its entertainment-area position.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ChannelInfo {
+    pub id: u8,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+fn default_assignment() -> BandAssignment {
+    BandAssignment::ByHeight
+}
+
+fn default_chase_ms() -> f32 {
+    80.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectSettings {
     /// Idle floor brightness 0..1.
@@ -37,9 +70,16 @@ pub struct EffectSettings {
     pub per_light_probability: f32,
     /// Palette slot used per band (low, low-mid, high-mid, high).
     pub band_slots: [usize; 4],
-    /// Bands each channel reacts to; empty = all bands.
+    /// Band routing strategy.
+    #[serde(default = "default_assignment")]
+    pub assignment: BandAssignment,
+    /// Bands each channel reacts to (Custom assignment); empty = all bands.
     #[serde(default)]
     pub channel_bands: Vec<(u8, Vec<Band>)>,
+    /// Left-to-right stagger of a beat flash across the reacting lights.
+    /// 0 disables the chase.
+    #[serde(default = "default_chase_ms")]
+    pub chase_ms: f32,
     /// Extra white flicker on very strong hits (Auto/Strobe modes).
     pub strobe_on_peaks: bool,
 }
@@ -54,24 +94,38 @@ impl Default for EffectSettings {
             mode: EffectMode::Auto,
             per_light_probability: 1.0,
             band_slots: [0, 1, 2, 3],
+            assignment: default_assignment(),
             channel_bands: Vec::new(),
+            chase_ms: default_chase_ms(),
             strobe_on_peaks: true,
         }
     }
 }
 
 struct ChannelState {
-    id: u8,
+    info: ChannelInfo,
+    /// Which bands this channel reacts to.
+    bands: [bool; 4],
     color: Color,
     target: Color,
     brightness: f32,
     strobe_until_ms: f64,
 }
 
+/// A beat flash scheduled in the future (chase stagger).
+struct PendingFlash {
+    due_ms: f64,
+    channel: usize,
+    color: Color,
+    peak: f32,
+    strobe: bool,
+}
+
 pub struct EffectEngine {
     settings: EffectSettings,
     palette: Palette,
     channels: Vec<ChannelState>,
+    pending: Vec<PendingFlash>,
     intensity: f32,
     panic: Option<Panic>,
     clock_ms: f64,
@@ -79,14 +133,88 @@ pub struct EffectEngine {
     frozen: Option<LightFrame>,
 }
 
+/// Height-based band routing: rank channels by z and spread them across the
+/// four bands; bands that end up with no channel are folded onto the
+/// nearest occupied group so every beat lights something.
+fn assign_by_height(channels: &[ChannelInfo]) -> Vec<[bool; 4]> {
+    let n = channels.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    // Stable spread even when heights are identical: tie-break on x, id.
+    order.sort_by(|&a, &b| {
+        let ca = &channels[a];
+        let cb = &channels[b];
+        ca.z
+            .total_cmp(&cb.z)
+            .then(ca.x.total_cmp(&cb.x))
+            .then(ca.id.cmp(&cb.id))
+    });
+
+    let mut buckets = vec![0usize; n];
+    for (rank, &idx) in order.iter().enumerate() {
+        let r = if n <= 1 { 0.5 } else { rank as f32 / (n - 1) as f32 };
+        buckets[idx] = (r * 3.0).round() as usize;
+    }
+
+    let mut masks = vec![[false; 4]; n];
+    for (idx, &b) in buckets.iter().enumerate() {
+        masks[idx][b] = true;
+    }
+    // Fold empty bands onto the nearest occupied bucket.
+    for band in 0..4usize {
+        if buckets.iter().any(|&b| b == band) {
+            continue;
+        }
+        let nearest = buckets
+            .iter()
+            .copied()
+            .min_by_key(|&b| (b as i32 - band as i32).abs())
+            .unwrap_or(0);
+        for (idx, &b) in buckets.iter().enumerate() {
+            if b == nearest {
+                masks[idx][band] = true;
+            }
+        }
+    }
+    masks
+}
+
+fn compute_masks(channels: &[ChannelInfo], settings: &EffectSettings) -> Vec<[bool; 4]> {
+    match settings.assignment {
+        BandAssignment::All => vec![[true; 4]; channels.len()],
+        BandAssignment::ByHeight => assign_by_height(channels),
+        BandAssignment::Custom => channels
+            .iter()
+            .map(|ch| {
+                match settings
+                    .channel_bands
+                    .iter()
+                    .find(|(cid, _)| *cid == ch.id)
+                {
+                    Some((_, bands)) if !bands.is_empty() => {
+                        let mut m = [false; 4];
+                        for b in bands {
+                            m[b.index()] = true;
+                        }
+                        m
+                    }
+                    _ => [true; 4],
+                }
+            })
+            .collect(),
+    }
+}
+
 impl EffectEngine {
-    pub fn new(channel_ids: &[u8], palette: Palette, settings: EffectSettings) -> Self {
+    pub fn new(channels: &[ChannelInfo], palette: Palette, settings: EffectSettings) -> Self {
         let base = palette.slot(0);
+        let masks = compute_masks(channels, &settings);
         Self {
-            channels: channel_ids
+            channels: channels
                 .iter()
-                .map(|&id| ChannelState {
-                    id,
+                .zip(masks)
+                .map(|(info, bands)| ChannelState {
+                    info: *info,
+                    bands,
                     color: base,
                     target: base,
                     brightness: settings.brightness_min,
@@ -95,6 +223,7 @@ impl EffectEngine {
                 .collect(),
             settings,
             palette,
+            pending: Vec::new(),
             intensity: 0.0,
             panic: None,
             clock_ms: 0.0,
@@ -109,6 +238,11 @@ impl EffectEngine {
 
     pub fn set_settings(&mut self, settings: EffectSettings) {
         self.settings = settings;
+        let infos: Vec<ChannelInfo> = self.channels.iter().map(|c| c.info).collect();
+        let masks = compute_masks(&infos, &self.settings);
+        for (ch, mask) in self.channels.iter_mut().zip(masks) {
+            ch.bands = mask;
+        }
     }
 
     pub fn set_panic(&mut self, panic: Option<Panic>) {
@@ -124,22 +258,9 @@ impl EffectEngine {
         self.intensity = intensity.clamp(0.0, 1.0);
     }
 
-    fn channel_reacts(&self, idx: usize, band: Band) -> bool {
-        let id = self.channels[idx].id;
-        match self
-            .settings
-            .channel_bands
-            .iter()
-            .find(|(cid, _)| *cid == id)
-        {
-            Some((_, bands)) if !bands.is_empty() => bands.contains(&band),
-            _ => true,
-        }
-    }
-
     pub fn on_beat(&mut self, beat: &BandBeatEvent) {
-        let color = self.palette.slot(self.settings.band_slots[beat.band.index()]);
         let s = &self.settings;
+        let color = self.palette.slot(s.band_slots[beat.band.index()]);
         let peak = s.brightness_min
             + (s.brightness_max - s.brightness_min) * beat.strength.clamp(0.2, 1.0);
         let strobe = s.strobe_on_peaks
@@ -147,32 +268,73 @@ impl EffectEngine {
             && (s.mode == EffectMode::Strobe
                 || (s.mode == EffectMode::Auto && self.intensity > 0.75));
         let prob = s.per_light_probability;
-        let strobe_until = self.clock_ms + 120.0;
+        let chase_ms = s.chase_ms.max(0.0) as f64;
 
-        for i in 0..self.channels.len() {
-            if !self.channel_reacts(i, beat.band) {
-                continue;
+        let mut reacting: Vec<usize> = (0..self.channels.len())
+            .filter(|&i| self.channels[i].bands[beat.band.index()])
+            .filter(|_| prob >= 1.0 || rand::random::<f32>() <= prob)
+            .collect();
+        // Left-to-right chase order.
+        reacting.sort_by(|&a, &b| self.channels[a].info.x.total_cmp(&self.channels[b].info.x));
+
+        let count = reacting.len();
+        for (i, idx) in reacting.into_iter().enumerate() {
+            let delay = if chase_ms > 0.0 && count > 1 {
+                chase_ms * i as f64 / (count - 1) as f64
+            } else {
+                0.0
+            };
+            if delay <= 0.0 {
+                self.apply_flash(idx, color, peak, strobe);
+            } else {
+                self.pending.push(PendingFlash {
+                    due_ms: self.clock_ms + delay,
+                    channel: idx,
+                    color,
+                    peak,
+                    strobe,
+                });
             }
-            if prob < 1.0 && rand::random::<f32>() > prob {
-                continue;
-            }
-            let ch = &mut self.channels[i];
-            ch.target = color;
-            ch.brightness = ch.brightness.max(peak);
-            if strobe {
-                ch.strobe_until_ms = strobe_until;
-            }
+        }
+    }
+
+    fn apply_flash(&mut self, idx: usize, color: Color, peak: f32, strobe: bool) {
+        let strobe_until = self.clock_ms + 120.0;
+        let ch = &mut self.channels[idx];
+        ch.target = color;
+        ch.brightness = ch.brightness.max(peak);
+        if strobe {
+            ch.strobe_until_ms = strobe_until;
         }
     }
 
     /// Advance time and produce the next frame; call at the stream rate.
     pub fn tick(&mut self, dt_ms: f64) -> LightFrame {
         self.clock_ms += dt_ms;
+
+        // Fire chase flashes that have come due.
+        let mut due = Vec::new();
+        self.pending.retain(|p| {
+            if p.due_ms <= self.clock_ms {
+                due.push((p.channel, p.color, p.peak, p.strobe));
+                false
+            } else {
+                true
+            }
+        });
+        for (idx, color, peak, strobe) in due {
+            self.apply_flash(idx, color, peak, strobe);
+        }
+
         if let Some(p) = self.panic {
             match p {
                 Panic::Blackout => {
                     return LightFrame {
-                        channels: self.channels.iter().map(|c| (c.id, Color::new(0, 0, 0))).collect(),
+                        channels: self
+                            .channels
+                            .iter()
+                            .map(|c| (c.info.id, Color::new(0, 0, 0)))
+                            .collect(),
                     }
                 }
                 Panic::WhiteFlash => {
@@ -180,7 +342,7 @@ impl EffectEngine {
                         channels: self
                             .channels
                             .iter()
-                            .map(|c| (c.id, Color::new(255, 255, 255)))
+                            .map(|c| (c.info.id, Color::new(255, 255, 255)))
                             .collect(),
                     }
                 }
@@ -221,7 +383,7 @@ impl EffectEngine {
                             b = 0.0;
                         }
                     }
-                    (ch.id, color.scaled(b))
+                    (ch.info.id, color.scaled(b))
                 })
                 .collect(),
         }
@@ -233,8 +395,8 @@ mod tests {
     use super::*;
     use core_types::Palette;
 
-    fn engine() -> EffectEngine {
-        let palette = Palette {
+    fn palette() -> Palette {
+        Palette {
             name: "test".into(),
             colors: vec![
                 Color::new(255, 0, 0),
@@ -242,11 +404,11 @@ mod tests {
                 Color::new(0, 0, 255),
                 Color::new(255, 255, 0),
             ],
-        };
-        let mut settings = EffectSettings::default();
-        settings.channel_bands = vec![(0, vec![Band::Low]), (1, vec![Band::High])];
-        settings.color_fade_ms = 20.0;
-        EffectEngine::new(&[0, 1], palette, settings)
+        }
+    }
+
+    fn ch(id: u8, x: f32, z: f32) -> ChannelInfo {
+        ChannelInfo { id, x, y: 0.0, z }
     }
 
     fn beat(band: Band) -> BandBeatEvent {
@@ -257,33 +419,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn band_routing_hits_assigned_channel_only() {
-        let mut e = engine();
-        e.on_beat(&beat(Band::Low));
-        let frame = e.tick(20.0);
-        let ch0 = frame.channels.iter().find(|(id, _)| *id == 0).unwrap().1;
-        let ch1 = frame.channels.iter().find(|(id, _)| *id == 1).unwrap().1;
-        // Channel 0 flashes red (slot 0); channel 1 stays near floor.
-        assert!(ch0.r > 150, "expected bright red on ch0, got {ch0:?}");
-        assert!(ch1.r < 60 && ch1.g < 60, "ch1 should stay dim, got {ch1:?}");
+    fn color_of(frame: &LightFrame, id: u8) -> Color {
+        frame.channels.iter().find(|(cid, _)| *cid == id).unwrap().1
+    }
+
+    fn no_chase_settings() -> EffectSettings {
+        EffectSettings {
+            chase_ms: 0.0,
+            color_fade_ms: 20.0,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn brightness_decays_after_beat() {
-        let mut e = engine();
+    fn by_height_routes_kick_to_floor_and_hats_to_ceiling() {
+        // Four lights bottom to top.
+        let chans = [ch(0, 0.0, -1.0), ch(1, 0.0, -0.3), ch(2, 0.0, 0.3), ch(3, 0.0, 1.0)];
+        let mut e = EffectEngine::new(&chans, palette(), no_chase_settings());
+
         e.on_beat(&beat(Band::Low));
-        let first = e.tick(20.0).channels[0].1;
-        for _ in 0..60 {
+        let f = e.tick(20.0);
+        assert!(color_of(&f, 0).r > 100, "floor light should flash red on kick");
+        assert!(color_of(&f, 3).r < 60, "ceiling light must not react to kick");
+
+        e.on_beat(&beat(Band::High));
+        let f = e.tick(20.0);
+        let top = color_of(&f, 3);
+        assert!(top.r > 100 && top.g > 100, "ceiling light should flash yellow on hats");
+    }
+
+    #[test]
+    fn empty_bands_fold_to_nearest_group() {
+        // Only two lights: every band must still reach one of them.
+        let chans = [ch(0, 0.0, -1.0), ch(1, 0.0, 1.0)];
+        let mut e = EffectEngine::new(&chans, palette(), no_chase_settings());
+        e.on_beat(&beat(Band::LowMid));
+        let f = e.tick(20.0);
+        let lit = f.channels.iter().any(|(_, c)| c.g > 100);
+        assert!(lit, "low-mid beat should light the nearest (bottom) group");
+    }
+
+    #[test]
+    fn chase_staggers_flashes_left_to_right() {
+        let chans = [ch(0, -1.0, 0.0), ch(1, 1.0, 0.0)];
+        let mut settings = no_chase_settings();
+        settings.assignment = BandAssignment::All;
+        settings.chase_ms = 100.0;
+        let mut e = EffectEngine::new(&chans, palette(), settings);
+        e.on_beat(&beat(Band::Low));
+        let f = e.tick(20.0);
+        let left = color_of(&f, 0);
+        let right = color_of(&f, 1);
+        assert!(left.r > 100, "left light flashes immediately");
+        assert!(right.r < 60, "right light is still waiting on the chase");
+        for _ in 0..5 {
             e.tick(20.0);
         }
-        let later = e.tick(20.0).channels[0].1;
-        assert!(later.r < first.r, "beat flash should decay: {first:?} -> {later:?}");
+        let f = e.tick(20.0);
+        assert!(color_of(&f, 1).r > 60, "right light flashes after the stagger");
+    }
+
+    #[test]
+    fn custom_assignment_still_works() {
+        let chans = [ch(0, 0.0, 0.0), ch(1, 0.0, 0.0)];
+        let mut settings = no_chase_settings();
+        settings.assignment = BandAssignment::Custom;
+        settings.channel_bands = vec![(0, vec![Band::Low]), (1, vec![Band::High])];
+        let mut e = EffectEngine::new(&chans, palette(), settings);
+        e.on_beat(&beat(Band::Low));
+        let f = e.tick(20.0);
+        assert!(color_of(&f, 0).r > 100);
+        assert!(color_of(&f, 1).r < 60);
     }
 
     #[test]
     fn blackout_panic_overrides() {
-        let mut e = engine();
+        let chans = [ch(0, 0.0, 0.0)];
+        let mut e = EffectEngine::new(&chans, palette(), no_chase_settings());
         e.on_beat(&beat(Band::Low));
         e.set_panic(Some(Panic::Blackout));
         let frame = e.tick(20.0);

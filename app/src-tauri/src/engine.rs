@@ -162,17 +162,36 @@ pub async fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
 
-    // ---- Hue entertainment channels (fall back to 4 virtual channels).
-    let mut channel_ids: Vec<u8> = vec![0, 1, 2, 3];
+    // ---- Hue entertainment channels with their positions
+    //      (fall back to 4 virtual channels spread bottom-left to top-right).
+    let mut channels: Vec<effects::ChannelInfo> = (0..4)
+        .map(|i| effects::ChannelInfo {
+            id: i as u8,
+            x: -1.0 + i as f32 * 2.0 / 3.0,
+            y: 0.0,
+            z: -1.0 + i as f32 * 2.0 / 3.0,
+        })
+        .collect();
     let mut hue: Option<(HueClient, String, PairedBridge)> = None;
     if let (Some(bridge), Some(cfg_id)) = (&config.bridge, &config.entertainment_config_id) {
         match HueClient::new(bridge) {
             Ok(client) => match client.entertainment_configs().await {
                 Ok(configs) => {
                     if let Some(ec) = configs.iter().find(|c| &c.id == cfg_id) {
-                        channel_ids = ec.channels.iter().map(|c| c.channel_id).collect();
-                        if channel_ids.is_empty() {
-                            channel_ids = vec![0];
+                        if !ec.channels.is_empty() {
+                            channels = ec
+                                .channels
+                                .iter()
+                                .map(|c| effects::ChannelInfo {
+                                    id: c.channel_id,
+                                    x: c.x as f32,
+                                    y: c.y as f32,
+                                    z: c.z as f32,
+                                })
+                                .collect();
+                            // Left-to-right order so the UI preview matches
+                            // the physical layout.
+                            channels.sort_by(|a, b| a.x.total_cmp(&b.x));
                         }
                         hue = Some((client, cfg_id.clone(), bridge.clone()));
                     }
@@ -192,7 +211,7 @@ pub async fn start(
     let initial_palette = palettes.lock().unwrap().palette_for(initial_genre);
 
     let effect = Arc::new(Mutex::new(EffectEngine::new(
-        &channel_ids,
+        &channels,
         initial_palette.clone(),
         config.effects.clone(),
     )));

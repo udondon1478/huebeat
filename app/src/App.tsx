@@ -387,6 +387,32 @@ function App() {
                 </select>
               </label>
               <label>
+                帯域→ライト割当
+                <select
+                  value={config.effects.assignment}
+                  onChange={(e) =>
+                    updateConfig({
+                      effects: { ...config.effects, assignment: e.target.value as "all" | "by_height" | "custom" },
+                    })
+                  }
+                >
+                  <option value="by_height">高さで自動(低音=下・高音=上)</option>
+                  <option value="all">全ライトが全帯域に反応</option>
+                  <option value="custom">カスタム(設定ファイル)</option>
+                </select>
+              </label>
+              <label>
+                チェイス(左→右の時間差) {Math.round(config.effects.chase_ms)}ms
+                <input
+                  type="range"
+                  min={0}
+                  max={300}
+                  step={10}
+                  value={config.effects.chase_ms}
+                  onChange={(e) => updateConfig({ effects: { ...config.effects, chase_ms: Number(e.target.value) } })}
+                />
+              </label>
+              <label>
                 最小輝度 {Math.round(config.effects.brightness_min * 100)}%
                 <input
                   type="range"

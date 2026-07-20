@@ -61,6 +61,8 @@ export interface AudioDeviceInfo {
   is_default: boolean;
 }
 
+export type BandAssignment = "all" | "by_height" | "custom";
+
 export interface EffectSettings {
   brightness_min: number;
   brightness_max: number;
@@ -69,7 +71,9 @@ export interface EffectSettings {
   mode: "auto" | "glow" | "strobe";
   per_light_probability: number;
   band_slots: [number, number, number, number];
+  assignment: BandAssignment;
   channel_bands: [number, Band[]][];
+  chase_ms: number;
   strobe_on_peaks: boolean;
 }
 
