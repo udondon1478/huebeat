@@ -10,6 +10,7 @@ members = [
     "crates/hue-stream",
     "crates/effects",
     "crates/osc-io",
+    "crates/diag",
     "app/src-tauri",
 ]
 

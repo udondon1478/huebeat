@@ -1,0 +1,13 @@
+[package]
+name = "diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+hue-client = { path = "../hue-client" }
+hue-stream = { path = "../hue-stream" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "default-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tracing-subscriber = "0.3"

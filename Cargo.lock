@@ -1096,6 +1096,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "diag"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+ "hue-client",
+ "hue-stream",
+ "reqwest",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2031,6 +2043,7 @@ name = "hue-stream"
 version = "0.1.0"
 dependencies = [
  "core-types",
+ "rustls",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

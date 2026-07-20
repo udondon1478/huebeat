@@ -47,6 +47,12 @@ npm run tauri build  # 配布ビルド
 cargo test --workspace --exclude app
 ```
 
+ブリッジ疎通診断(/auth/v2・エリア・DTLS ハンドシェイク・レインボー送信を順に検証):
+
+```sh
+cargo run -p diag -- <bridge_ip> <app_key> <client_key> <entertainment_config_id>
+```
+
 ## 使い方
 
 1. START の前に **Setup** でオーディオ入力(既定=再生デバイスのループバック)を選択

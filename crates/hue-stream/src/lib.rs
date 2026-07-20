@@ -87,6 +87,13 @@ impl HueStreamer {
         if config_id.len() != 36 {
             return Err(StreamError::BadConfigId(config_id.len()));
         }
+        // webrtc-dtls uses rustls internally; a process-level crypto
+        // provider must be installed once or the handshake panics.
+        static CRYPTO: std::sync::Once = std::sync::Once::new();
+        CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
         let psk = decode_hex(client_key)?;
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect((bridge_ip, HUE_STREAM_PORT)).await?;
@@ -96,11 +103,16 @@ impl HueStreamer {
             psk: Some(Arc::new(move |_hint: &[u8]| Ok(psk.clone()))),
             psk_identity_hint: Some(identity),
             cipher_suites: vec![CipherSuiteId::Tls_Psk_With_Aes_128_Gcm_Sha256],
+            server_name: bridge_ip.to_string(),
             ..Default::default()
         };
-        let conn = DTLSConn::new(Arc::new(socket), config, true, None)
-            .await
-            .map_err(|e| StreamError::Dtls(e.to_string()))?;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            DTLSConn::new(Arc::new(socket), config, true, None),
+        )
+        .await
+        .map_err(|_| StreamError::Dtls("handshake timed out (no DTLS response)".into()))?
+        .map_err(|e| StreamError::Dtls(e.to_string()))?;
         tracing::info!(bridge_ip, config_id, "hue entertainment DTLS session established");
         Ok(Self {
             conn,
