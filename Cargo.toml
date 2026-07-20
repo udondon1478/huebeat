@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-types",
+    "crates/audio-capture",
+    "crates/analysis",
+    "crates/genre",
+    "crates/palette",
+    "crates/hue-client",
+    "crates/hue-stream",
+    "crates/effects",
+    "crates/osc-io",
+    "app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Audio analysis is unusably slow unoptimized; keep DSP crates fast in dev builds.
+[profile.dev.package.rustfft]
+opt-level = 3

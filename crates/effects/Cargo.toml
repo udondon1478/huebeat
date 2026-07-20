@@ -1,0 +1,10 @@
+[package]
+name = "effects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+rand = "0.10.2"
+serde = { workspace = true, features = ["derive"] }

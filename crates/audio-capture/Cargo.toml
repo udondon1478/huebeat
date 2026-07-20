@@ -1,0 +1,13 @@
+[package]
+name = "audio-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+cpal = "0.18.1"
+ringbuf = "0.5.1"
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true

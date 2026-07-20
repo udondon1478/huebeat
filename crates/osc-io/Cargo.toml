@@ -1,0 +1,11 @@
+[package]
+name = "osc-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+rosc = "0.11.4"
+thiserror.workspace = true
+tracing.workspace = true

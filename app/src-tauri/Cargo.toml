@@ -1,0 +1,36 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "hue2 — audio-reactive Philips Hue lighting for DJ performance"
+authors = ["udon"]
+edition = "2021"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+core-types = { path = "../../crates/core-types" }
+audio-capture = { path = "../../crates/audio-capture" }
+analysis = { path = "../../crates/analysis" }
+genre = { path = "../../crates/genre" }
+palette = { path = "../../crates/palette" }
+hue-client = { path = "../../crates/hue-client" }
+hue-stream = { path = "../../crates/hue-stream" }
+effects = { path = "../../crates/effects" }
+osc-io = { path = "../../crates/osc-io" }
