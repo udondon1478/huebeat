@@ -462,6 +462,43 @@ function App() {
                   }
                 />
               </label>
+              <h2>ビート検出閾値</h2>
+              <p className="hint">閾値: 低いほど敏感に発火 / 間隔: 同帯域の連続発火を抑える最小時間</p>
+              {BANDS.map((b, i) => (
+                <div key={b} className="band-tune-row">
+                  <span className="band-tune-label">{BAND_LABELS[b]}</span>
+                  <label>
+                    閾値 {config.analyzer.sensitivity[i].toFixed(1)}σ
+                    <input
+                      type="range"
+                      min={1.0}
+                      max={4.0}
+                      step={0.1}
+                      value={config.analyzer.sensitivity[i]}
+                      onChange={(e) => {
+                        const sensitivity = [...config.analyzer.sensitivity] as [number, number, number, number];
+                        sensitivity[i] = Number(e.target.value);
+                        updateConfig({ analyzer: { ...config.analyzer, sensitivity } });
+                      }}
+                    />
+                  </label>
+                  <label>
+                    間隔 {Math.round(config.analyzer.min_interval_ms[i])}ms
+                    <input
+                      type="range"
+                      min={40}
+                      max={400}
+                      step={10}
+                      value={config.analyzer.min_interval_ms[i]}
+                      onChange={(e) => {
+                        const min_interval_ms = [...config.analyzer.min_interval_ms] as [number, number, number, number];
+                        min_interval_ms[i] = Number(e.target.value);
+                        updateConfig({ analyzer: { ...config.analyzer, min_interval_ms } });
+                      }}
+                    />
+                  </label>
+                </div>
+              ))}
               <label className="check">
                 <input
                   type="checkbox"
@@ -470,7 +507,7 @@ function App() {
                     updateConfig({ analyzer: { ...config.analyzer, low_only: e.target.checked } })
                   }
                 />
-                低域のみでビート検出(エンジン再起動で反映)
+                低域のみでビート検出
               </label>
               <label className="check">
                 <input

@@ -339,7 +339,14 @@ impl Analyzer {
         };
 
         // Score each lag together with its half/double harmonics so the
-        // fundamental beat period wins over its subdivisions.
+        // fundamental beat period wins over its subdivisions. A mild
+        // log-domain prior centred on club tempos breaks octave ties
+        // toward 120-140 instead of their halves.
+        let prior = |lag: f32| -> f32 {
+            let bpm = 60.0 * hop_rate / lag;
+            let x = (bpm / 128.0).log2() / 0.9;
+            (-0.5 * x * x).exp()
+        };
         let mut best_lag = 0usize;
         let mut best_score = f32::NEG_INFINITY;
         for lag in lag_min..=lag_max {
@@ -347,6 +354,9 @@ impl Analyzer {
             let double = lag * 2;
             if double < n - 8 {
                 score += 0.5 * acf_at(double);
+            }
+            if score > 0.0 {
+                score *= prior(lag as f32);
             }
             if score > best_score {
                 best_score = score;
@@ -370,11 +380,13 @@ impl Analyzer {
         let lag = best_lag as f32 + delta;
         let mut bpm = 60.0 * hop_rate / lag;
 
-        // Fold into a sane dance-music range.
+        // Fold into a sane dance-music range. The ceiling must stay at or
+        // above BPM_MAX: folding e.g. 195 down to 97.5 would push hardcore
+        // tracks straight into the hip-hop tempo range.
         while bpm < 70.0 {
             bpm *= 2.0;
         }
-        while bpm > 190.0 {
+        while bpm > BPM_MAX {
             bpm /= 2.0;
         }
 

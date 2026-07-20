@@ -66,6 +66,10 @@ impl FeatureAggregator {
         }
     }
 
+    fn push_beat(&mut self, b: BandBeatEvent) {
+        self.beats.push_back(b);
+    }
+
     fn features(&self) -> Option<Features> {
         if self.frames.len() < 50 {
             return None;
@@ -93,12 +97,41 @@ impl FeatureAggregator {
         let per_sec = |count: usize| count as f32 * 1000.0 / span_ms;
         let kicks = self.beats.iter().filter(|b| b.band == Band::Low).count();
         let hats = self.beats.iter().filter(|b| b.band == Band::High).count();
+
+        // Inter-kick intervals: implied kick-grid BPM + how regular the
+        // grid is (used for four-on-floor vs breakbeat and half-tempo
+        // octave correction in the classifier).
+        let mut low_ibis: Vec<f32> = Vec::new();
+        let mut prev: Option<u64> = None;
+        for b in self.beats.iter().filter(|b| b.band == Band::Low) {
+            if let Some(p) = prev {
+                let d = (b.timestamp_ms - p) as f32;
+                if (120.0..2000.0).contains(&d) {
+                    low_ibis.push(d);
+                }
+            }
+            prev = Some(b.timestamp_ms);
+        }
+        let (kick_ibi_bpm, kick_regularity) = if low_ibis.len() >= 4 {
+            low_ibis.sort_by(|a, b| a.total_cmp(b));
+            let median = low_ibis[low_ibis.len() / 2];
+            let close = low_ibis
+                .iter()
+                .filter(|d| (**d - median).abs() <= median * 0.12)
+                .count();
+            (60000.0 / median, close as f32 / low_ibis.len() as f32)
+        } else {
+            (0.0, 0.0)
+        };
+
         Some(Features {
             bpm: self.last_tempo.map(|t| t.bpm).unwrap_or(0.0),
             bpm_confidence: self.last_tempo.map(|t| t.confidence).unwrap_or(0.0),
             band_energy,
             kick_density: per_sec(kicks),
             hat_density: per_sec(hats),
+            kick_ibi_bpm,
+            kick_regularity,
             centroid: centroid / n,
             intensity: intensity / n,
         })
@@ -112,6 +145,8 @@ pub struct RunningEngine {
     pub current_genre: Arc<Mutex<Genre>>,
     pub current_palette: Arc<Mutex<Palette>>,
     pub last_bpm: Arc<Mutex<f32>>,
+    /// Pending analyzer config picked up by the analysis thread.
+    analyzer_update: Arc<Mutex<Option<analysis::AnalyzerConfig>>>,
 }
 
 impl RunningEngine {
@@ -125,6 +160,11 @@ impl RunningEngine {
 
     pub fn set_effect_settings(&self, settings: EffectSettings) {
         self.effect.lock().unwrap().set_settings(settings);
+    }
+
+    /// Live-apply beat-detection settings without restarting the engine.
+    pub fn set_analyzer_settings(&self, config: analysis::AnalyzerConfig) {
+        *self.analyzer_update.lock().unwrap() = Some(config);
     }
 
     pub fn set_palette(&self, p: Palette) {
@@ -268,15 +308,21 @@ pub async fn start(
         .map_err(|e| format!("audio capture failed: {e}"))?;
 
     // Analysis thread: raw samples -> frames/beats/tempo messages.
+    let analyzer_update: Arc<Mutex<Option<analysis::AnalyzerConfig>>> =
+        Arc::new(Mutex::new(None));
     {
         let stop = stop.clone();
         let analyzer_cfg = config.analyzer.to_analyzer_config();
+        let analyzer_update = analyzer_update.clone();
         let msg_tx = msg_tx.clone();
         std::thread::Builder::new()
             .name("analysis".into())
             .spawn(move || {
                 let mut analyzer = Analyzer::new(sample_rate, analyzer_cfg);
                 while !stop.load(Ordering::SeqCst) {
+                    if let Some(cfg) = analyzer_update.lock().unwrap().take() {
+                        analyzer.set_config(cfg);
+                    }
                     match raw_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                         Ok(samples) => {
                             for hop in analyzer.feed(&samples) {
@@ -330,6 +376,7 @@ pub async fn start(
                             let _ = osc.send_beat(beat.band, beat.strength);
                         }
                         let _ = app.emit("engine:beat", &beat);
+                        aggregator.push_beat(beat);
                     }
                     AnalysisMsg::Tempo(t) => {
                         *last_bpm.lock().unwrap() = t.bpm;
@@ -440,6 +487,7 @@ pub async fn start(
         current_genre,
         current_palette,
         last_bpm,
+        analyzer_update,
     })
 }
 

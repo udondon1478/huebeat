@@ -96,10 +96,11 @@ fn set_config(state: State<'_, AppState>, config: AppConfig) {
         *cfg = config;
     }
     state.save_config();
-    // Live-apply effect settings when running.
+    // Live-apply effect + analyzer settings when running.
     let cfg = state.config.lock().unwrap().clone();
     if let Some(engine) = state.engine.lock().unwrap().as_ref() {
         engine.set_effect_settings(cfg.effects);
+        engine.set_analyzer_settings(cfg.analyzer.to_analyzer_config());
     }
 }
 

@@ -336,3 +336,31 @@ button:disabled {
   font-size: 13px;
   margin: 6px 0;
 }
+
+/* ---- per-band beat-detection tuning ---- */
+.hint {
+  margin: -4px 0 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.band-tune-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 1fr;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.band-tune-row .band-tune-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  padding-bottom: 10px;
+}
+
+.band-tune-row label {
+  margin-bottom: 0;
+  font-size: 11px;
+}
