@@ -18,6 +18,15 @@ export interface AnalysisFrame {
   intensity: number;
   spectral_centroid: number;
   spectrum: number[];
+  /** Per-band onset flux, normalized 0..1. */
+  band_flux: [number, number, number, number];
+  /** Effective beat threshold on the same 0..1 scale as band_flux. */
+  band_threshold: [number, number, number, number];
+  /** Running flux mean / std (normalized) for fader-drag → σ mapping. */
+  band_flux_mean: [number, number, number, number];
+  band_flux_std: [number, number, number, number];
+  /** Raw slow-decay flux peak per band; meter position × this = raw flux. */
+  band_flux_max: [number, number, number, number];
 }
 
 export interface BandBeatEvent {
@@ -77,10 +86,15 @@ export interface EffectSettings {
   strobe_on_peaks: boolean;
 }
 
+export type ThresholdMode = "auto" | "manual";
+
 export interface AnalyzerSettings {
   sensitivity: [number, number, number, number];
   min_interval_ms: [number, number, number, number];
   low_only: boolean;
+  threshold_mode: ThresholdMode;
+  /** Fixed per-band threshold in raw flux units (manual mode); <= 0 = unset. */
+  manual_threshold: [number, number, number, number];
 }
 
 export interface AppConfig {
@@ -110,16 +124,37 @@ export interface EngineStatus {
 export const GENRE_LABELS: Record<string, string> = {
   deep_house: "Deep House",
   house: "House",
+  tech_house: "Tech House",
+  electro_house: "EDM / Big Room",
+  nu_disco: "Nu Disco",
+  net_pop: "Net Pop / J-Pop",
+  uk_garage: "UK Garage",
+  jersey_club: "Jersey Club",
   techno: "Techno",
   trance: "Trance",
+  psytrance: "Psytrance",
+  hardstyle: "Hardstyle",
+  eurobeat: "Eurobeat",
+  anison_remix: "アニソンRemix",
+  breakbeat: "Breakbeat",
   drum_and_bass: "Drum & Bass",
   dubstep: "Dubstep",
+  trap: "Trap",
+  hyperflip: "Hyperflip",
+  future_bass: "Future Bass",
+  future_core: "Future Core",
   hardcore: "Hardcore",
   kawaii_future_bass: "Kawaii Future Bass",
   hip_hop: "Hip Hop",
+  rnb: "R&B",
+  reggaeton: "Reggaeton",
+  synthwave: "Synthwave",
   ambient: "Ambient",
   unknown: "Auto / Unknown",
 };
+
+/** Top genre candidates emitted by the engine: [genre_id, share 0..1]. */
+export type GenreScore = [string, number];
 
 export const BANDS: Band[] = ["low", "low_mid", "high_mid", "high"];
 export const BAND_LABELS: Record<Band, string> = {
@@ -131,4 +166,9 @@ export const BAND_LABELS: Record<Band, string> = {
 
 export function rgbCss(c: Color): string {
   return `rgb(${c.r}, ${c.g}, ${c.b})`;
+}
+
+export function colorToHex(c: Color): string {
+  const h = (v: number) => v.toString(16).padStart(2, "0");
+  return `#${h(c.r)}${h(c.g)}${h(c.b)}`;
 }
