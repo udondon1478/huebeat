@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use core_types::{
-    AnalysisFrame, Band, BandBeatEvent, BandConfig, TempoEstimate, TempoSource,
+    AnalysisFrame, Band, BandBeatEvent, BandConfig, TempoEstimate, TempoSource, ThresholdMode,
 };
 use rustfft::num_complex::Complex;
 use rustfft::Fft;
@@ -32,6 +32,11 @@ pub struct AnalyzerConfig {
     pub min_interval_ms: [f32; 4],
     /// Only detect beats in the low band (LightBeat's "bass only" mode).
     pub low_only: bool,
+    /// Adaptive (Auto) vs fixed (Manual) beat threshold.
+    pub threshold_mode: ThresholdMode,
+    /// Fixed per-band threshold in raw flux units, used in Manual mode;
+    /// <= 0 means unset and falls back to the adaptive threshold.
+    pub manual_threshold: [f32; 4],
 }
 
 impl Default for AnalyzerConfig {
@@ -41,6 +46,8 @@ impl Default for AnalyzerConfig {
             sensitivity: [2.2, 2.4, 2.4, 2.4],
             min_interval_ms: [150.0, 100.0, 100.0, 80.0],
             low_only: false,
+            threshold_mode: ThresholdMode::Auto,
+            manual_threshold: [0.0; 4],
         }
     }
 }
@@ -57,6 +64,8 @@ struct BandState {
     flux_history: VecDeque<f32>,
     last_beat_ms: f64,
     energy_max: f32,
+    /// Slow-decay flux peak used to normalize flux/threshold for the UI.
+    flux_max: f32,
 }
 
 pub struct Analyzer {
@@ -110,6 +119,7 @@ impl Analyzer {
                 flux_history: VecDeque::with_capacity(FLUX_HISTORY),
                 last_beat_ms: f64::NEG_INFINITY,
                 energy_max: 1e-6,
+                flux_max: 1e-6,
             })
             .collect();
 
@@ -150,14 +160,20 @@ impl Analyzer {
         }
     }
 
+    /// Apply new settings in place, preserving all runtime state
+    /// (flux history, flux_max, refractory clocks, BPM smoothing) so that
+    /// live tuning — e.g. throttled fader drags — never resets detection
+    /// warmup or the UI normalization scale.
     pub fn set_config(&mut self, config: AnalyzerConfig) {
-        let sr = self.sample_rate as u32;
-        let mut fresh = Analyzer::new(sr, config);
-        std::mem::swap(self, &mut fresh);
-        // Carry over smoothed state so the UI doesn't reset.
-        self.bpm_smoothed = fresh.bpm_smoothed;
-        self.intensity = fresh.intensity;
-        self.rms_max = fresh.rms_max;
+        let hz_per_bin = self.sample_rate / FFT_SIZE as f32;
+        let bin_for = |hz: f32| ((hz / hz_per_bin).round() as usize).clamp(1, FFT_SIZE / 2);
+        for (i, band) in self.bands.iter_mut().enumerate() {
+            band.bin_range = (
+                bin_for(config.bands.edges[i]),
+                bin_for(config.bands.edges[i + 1]),
+            );
+        }
+        self.config = config;
     }
 
     /// Feed mono samples; returns one `HopOutput` per completed hop.
@@ -221,6 +237,11 @@ impl Analyzer {
             band_flux[bi] = flux / width.sqrt();
         }
         let total_flux: f32 = band_flux.iter().sum();
+        let mut ui_flux = [0.0f32; 4];
+        let mut ui_threshold = [0.0f32; 4];
+        let mut ui_mean = [0.0f32; 4];
+        let mut ui_std = [0.0f32; 4];
+        let mut ui_flux_max = [0.0f32; 4];
         for (bi, band) in self.bands.iter_mut().enumerate() {
             let (a, b) = band.bin_range;
             let flux = band_flux[bi];
@@ -245,14 +266,32 @@ impl Analyzer {
             }
 
             let enabled = !self.config.low_only || bi == 0;
-            let threshold = mean + self.config.sensitivity[bi] * std;
+            let auto_threshold = mean + self.config.sensitivity[bi] * std;
+            // Manual mode pins the threshold at a fixed raw flux level
+            // (constant-gain premise); an unset (<= 0) band stays adaptive.
+            let manual = self.config.threshold_mode == ThresholdMode::Manual
+                && self.config.manual_threshold[bi] > 0.0;
+            let threshold = if manual {
+                self.config.manual_threshold[bi]
+            } else {
+                auto_threshold
+            };
+            // Normalize flux + threshold onto a shared 0..1 scale for the UI
+            // fader; the slow-decay peak tracks both so the fader line always
+            // stays within the visible meter.
+            band.flux_max = (band.flux_max * 0.9995).max(flux).max(threshold).max(1e-6);
+            ui_flux[bi] = (flux / band.flux_max).clamp(0.0, 1.0);
+            ui_threshold[bi] = (threshold / band.flux_max).clamp(0.0, 1.0);
+            ui_mean[bi] = (mean / band.flux_max).clamp(0.0, 1.0);
+            ui_std[bi] = (std / band.flux_max).max(1e-4);
+            ui_flux_max[bi] = band.flux_max;
             // Gate out spectral leakage: a band only fires when it carries a
             // meaningful share of this hop's total onset energy, so a kick
             // doesn't trigger the (otherwise silent) high band and vice versa.
             let dominant = flux >= total_flux * 0.15;
             if enabled
                 && dominant
-                && band.flux_history.len() >= FLUX_HISTORY / 4
+                && (manual || band.flux_history.len() >= FLUX_HISTORY / 4)
                 && flux > threshold
                 && now_ms - band.last_beat_ms >= self.config.min_interval_ms[bi] as f64
             {
@@ -307,6 +346,11 @@ impl Analyzer {
                 intensity: self.intensity,
                 spectral_centroid: centroid,
                 spectrum,
+                band_flux: ui_flux,
+                band_threshold: ui_threshold,
+                band_flux_mean: ui_mean,
+                band_flux_std: ui_std,
+                band_flux_max: ui_flux_max,
             },
             beats,
             tempo,
@@ -491,6 +535,70 @@ mod tests {
         let high = beats.iter().filter(|b| b.band == Band::High).count();
         assert!(high >= 10, "high band should fire on hats, got {high}");
         assert!(low <= 2, "low band should stay quiet, got {low}");
+    }
+
+    fn run_with(cfg: AnalyzerConfig, samples: &[f32]) -> (Vec<BandBeatEvent>, Vec<AnalysisFrame>) {
+        let mut a = Analyzer::new(SR, cfg);
+        let mut beats = Vec::new();
+        let mut frames = Vec::new();
+        for chunk in samples.chunks(1024) {
+            for hop in a.feed(chunk) {
+                beats.extend(hop.beats);
+                frames.push(hop.frame);
+            }
+        }
+        (beats, frames)
+    }
+
+    #[test]
+    fn manual_mode_fires_at_fixed_threshold() {
+        let audio = beat_track(120.0, 55.0, 8.0);
+        // Learn the raw low-band flux peak from an auto-mode pass.
+        let (_, frames) = run_with(AnalyzerConfig::default(), &audio);
+        let peak = frames
+            .iter()
+            .map(|f| f.band_flux[0] * f.band_flux_max[0])
+            .fold(0.0f32, f32::max);
+        assert!(peak > 0.0);
+
+        let mut cfg = AnalyzerConfig::default();
+        cfg.threshold_mode = ThresholdMode::Manual;
+        cfg.manual_threshold = [peak * 0.5, 0.0, 0.0, 0.0];
+        let (beats, _) = run_with(cfg.clone(), &audio);
+        let low = beats.iter().filter(|b| b.band == Band::Low).count();
+        assert!(low >= 10, "manual threshold at half peak should fire on kicks, got {low}");
+
+        cfg.manual_threshold[0] = peak * 10.0;
+        let (beats, _) = run_with(cfg, &audio);
+        let low = beats.iter().filter(|b| b.band == Band::Low).count();
+        assert_eq!(low, 0, "threshold far above peak must never fire, got {low}");
+    }
+
+    #[test]
+    fn manual_mode_unset_falls_back_to_auto() {
+        let audio = beat_track(120.0, 55.0, 8.0);
+        let mut cfg = AnalyzerConfig::default();
+        cfg.threshold_mode = ThresholdMode::Manual; // all thresholds unset (0)
+        let (beats, _) = run_with(cfg, &audio);
+        let low = beats.iter().filter(|b| b.band == Band::Low).count();
+        assert!(low >= 10, "unset manual thresholds should behave like auto, got {low}");
+    }
+
+    #[test]
+    fn set_config_preserves_runtime_state() {
+        let audio = beat_track(120.0, 55.0, 2.0);
+        let mut a = Analyzer::new(SR, AnalyzerConfig::default());
+        for chunk in audio.chunks(1024) {
+            a.feed(chunk);
+        }
+        let hist_len = a.bands[0].flux_history.len();
+        let flux_max = a.bands[0].flux_max;
+        assert!(hist_len > 0);
+        let mut cfg = AnalyzerConfig::default();
+        cfg.sensitivity[0] = 3.0;
+        a.set_config(cfg);
+        assert_eq!(a.bands[0].flux_history.len(), hist_len);
+        assert_eq!(a.bands[0].flux_max, flux_max);
     }
 
     #[test]

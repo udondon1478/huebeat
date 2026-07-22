@@ -4,21 +4,31 @@ import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 import {
   AnalysisFrame,
+  AnalyzerSettings,
   AppConfig,
   AudioDeviceInfo,
   BAND_LABELS,
   BANDS,
   BandBeatEvent,
+  Color,
   DiscoveredBridge,
   EntertainmentConfig,
   GENRE_LABELS,
+  GenreScore,
   LightFrame,
   PairedBridge,
   Palette,
   PaletteEntry,
   TempoEstimate,
+  ThresholdMode,
+  colorToHex,
   rgbCss,
 } from "./types";
+
+function hexToColor(hex: string): Color {
+  const v = parseInt(hex.replace("#", ""), 16);
+  return { r: (v >> 16) & 0xff, g: (v >> 8) & 0xff, b: v & 0xff };
+}
 
 function Spectrum({ frameRef }: { frameRef: React.MutableRefObject<AnalysisFrame | null> }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -50,6 +60,213 @@ function Spectrum({ frameRef }: { frameRef: React.MutableRefObject<AnalysisFrame
   return <canvas ref={canvasRef} width={560} height={140} className="spectrum" />;
 }
 
+const SIGMA_MIN = 0.5;
+const SIGMA_MAX = 6.0;
+const BAND_COLORS = ["#ff5d73", "#ffb454", "#4dd08c", "#59b7ff"];
+
+/**
+ * Sound2Light-style per-band meters: live onset flux as a vertical bar with
+ * a threshold fader line overlaid. When interactive, dragging the line
+ * either maps its meter position back to a sensitivity in σ (auto mode) or
+ * sets a fixed threshold in raw flux units (manual mode).
+ */
+function BandMeters({
+  frameRef,
+  beatFlashRef,
+  sensitivity,
+  mode,
+  interactive,
+  onSensitivity,
+  onManualThreshold,
+}: {
+  frameRef: React.MutableRefObject<AnalysisFrame | null>;
+  beatFlashRef: React.MutableRefObject<Record<string, number>>;
+  sensitivity: [number, number, number, number];
+  mode: ThresholdMode;
+  interactive: boolean;
+  onSensitivity: (index: number, sigma: number, commit: boolean) => void;
+  onManualThreshold: (index: number, raw: number, commit: boolean) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const dragRef = useRef<{ band: number; p: number } | null>(null);
+  const sensRef = useRef(sensitivity);
+  sensRef.current = sensitivity;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+
+  // A mode / interactivity switch mid-drag would leave a stale grab behind.
+  useEffect(() => {
+    dragRef.current = null;
+  }, [mode, interactive]);
+
+  useEffect(() => {
+    let raf = 0;
+    const draw = () => {
+      raf = requestAnimationFrame(draw);
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      const { width, height } = canvas;
+      const frame = frameRef.current;
+      const now = Date.now();
+      ctx.clearRect(0, 0, width, height);
+      const colW = width / 4;
+      const meterTop = 4;
+      const meterBottom = height - 20;
+      const meterH = meterBottom - meterTop;
+
+      for (let i = 0; i < 4; i++) {
+        const x0 = i * colW + 8;
+        const w = colW - 16;
+        const hit = now - (beatFlashRef.current[BANDS[i]] ?? 0) < 150;
+
+        // Track.
+        ctx.fillStyle = "#12121d";
+        ctx.fillRect(x0, meterTop, w, meterH);
+
+        if (frame) {
+          // Flux bar.
+          const flux = frame.band_flux[i];
+          const barH = flux * meterH;
+          ctx.fillStyle = hit ? "#ffffff" : BAND_COLORS[i];
+          ctx.globalAlpha = hit ? 1 : 0.85;
+          ctx.fillRect(x0, meterBottom - barH, w, barH);
+          ctx.globalAlpha = 1;
+
+          // Mean line (faint reference).
+          const meanY = meterBottom - frame.band_flux_mean[i] * meterH;
+          ctx.strokeStyle = "rgba(255,255,255,0.25)";
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(x0, meanY);
+          ctx.lineTo(x0 + w, meanY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Threshold fader line: while dragging show the grabbed position,
+          // otherwise the live effective threshold from the analyzer.
+          const drag = dragRef.current;
+          const p = drag?.band === i ? drag.p : frame.band_threshold[i];
+          const y = meterBottom - p * meterH;
+          ctx.strokeStyle = drag?.band === i ? "#ffe14d" : "#ffcf3d";
+          ctx.lineWidth = drag?.band === i ? 3 : 2;
+          ctx.beginPath();
+          ctx.moveTo(x0 - 4, y);
+          ctx.lineTo(x0 + w + 4, y);
+          ctx.stroke();
+          ctx.lineWidth = 1;
+          // Handle triangles at both ends.
+          ctx.fillStyle = ctx.strokeStyle;
+          ctx.beginPath();
+          ctx.moveTo(x0 - 4, y - 5);
+          ctx.lineTo(x0 - 4, y + 5);
+          ctx.lineTo(x0 + 3, y);
+          ctx.closePath();
+          ctx.fill();
+          ctx.beginPath();
+          ctx.moveTo(x0 + w + 4, y - 5);
+          ctx.lineTo(x0 + w + 4, y + 5);
+          ctx.lineTo(x0 + w - 3, y);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        // Label + readout: σ in auto mode, meter percent in manual mode.
+        const drag = dragRef.current;
+        const linePos =
+          drag?.band === i ? drag.p : frame ? frame.band_threshold[i] : null;
+        const readout =
+          modeRef.current === "manual"
+            ? linePos !== null
+              ? `${Math.round(linePos * 100)}%`
+              : "--"
+            : `${sensRef.current[i].toFixed(1)}σ`;
+        ctx.fillStyle = hit ? "#ffffff" : "#8a8aa3";
+        ctx.font = "700 11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(`${BAND_LABELS[BANDS[i]]}  ${readout}`, x0 + w / 2, height - 6);
+      }
+    };
+    draw();
+    return () => cancelAnimationFrame(raf);
+  }, [frameRef, beatFlashRef]);
+
+  const posFromEvent = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current!;
+    const rect = canvas.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
+    const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
+    const band = Math.min(3, Math.max(0, Math.floor(x / (canvas.width / 4))));
+    const meterTop = 4;
+    const meterBottom = canvas.height - 20;
+    const p = (meterBottom - y) / (meterBottom - meterTop);
+    return { band, p: Math.min(1, Math.max(0.02, p)) };
+  };
+
+  const sigmaFromPos = (band: number, p: number): number | null => {
+    const frame = frameRef.current;
+    if (!frame) return null;
+    const std = Math.max(frame.band_flux_std[band], 1e-4);
+    const sigma = (p - frame.band_flux_mean[band]) / std;
+    return Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigma));
+  };
+
+  const emitDrag = (band: number, p: number, commit: boolean) => {
+    if (modeRef.current === "manual") {
+      const frame = frameRef.current;
+      if (!frame) return;
+      onManualThreshold(band, p * frame.band_flux_max[band], commit);
+    } else {
+      const sigma = sigmaFromPos(band, p);
+      if (sigma !== null) onSensitivity(band, sigma, commit);
+    }
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!interactive || !frameRef.current) return;
+    const { band, p } = posFromEvent(e);
+    dragRef.current = { band, p };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    emitDrag(band, p, false);
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const { p } = posFromEvent(e);
+    drag.p = p;
+    emitDrag(drag.band, p, false);
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    dragRef.current = null;
+    emitDrag(drag.band, drag.p, true);
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  };
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={560}
+      height={170}
+      className="band-meters"
+      style={{ cursor: interactive ? "ns-resize" : "default" }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      title={
+        interactive
+          ? "黄色いラインをドラッグしてビート検出閾値を調整"
+          : "ビート検出モニター(調整は詳細設定モードを有効化)"
+      }
+    />
+  );
+}
+
 function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [running, setRunning] = useState(false);
@@ -57,8 +274,11 @@ function App() {
   const [bpm, setBpm] = useState(0);
   const [bpmConfidence, setBpmConfidence] = useState(0);
   const [genre, setGenre] = useState("unknown");
+  const [genreScores, setGenreScores] = useState<GenreScore[]>([]);
   const [palette, setPalette] = useState<Palette | null>(null);
   const [palettes, setPalettes] = useState<PaletteEntry[]>([]);
+  const [editGenreId, setEditGenreId] = useState("unknown");
+  const [resetAllArmed, setResetAllArmed] = useState(false);
   const [lights, setLights] = useState<LightFrame | null>(null);
   const [devices, setDevices] = useState<AudioDeviceInfo[]>([]);
   const [bridges, setBridges] = useState<DiscoveredBridge[]>([]);
@@ -67,10 +287,22 @@ function App() {
   const [manualIp, setManualIp] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [panic, setPanicState] = useState<string | null>(null);
-  const [beatFlash, setBeatFlash] = useState<Record<string, number>>({});
+  const [advancedMode, setAdvancedMode] = useState(
+    () =>
+      (localStorage.getItem("huebeat:advancedMode") ??
+        localStorage.getItem("hue2:advancedMode")) === "1"
+  );
 
   const frameRef = useRef<AnalysisFrame | null>(null);
+  const beatFlashRef = useRef<Record<string, number>>({});
   const pairingRef = useRef(false);
+  const sensSendTimer = useRef<number | null>(null);
+  const pendingConfigRef = useRef<AppConfig | null>(null);
+  const configRef = useRef<AppConfig | null>(null);
+  configRef.current = config;
+  const paletteSendTimer = useRef<number | null>(null);
+  const pendingPaletteRef = useRef<PaletteEntry | null>(null);
+  const resetAllTimer = useRef<number | null>(null);
 
   const refreshAreas = useCallback(async () => {
     try {
@@ -100,10 +332,11 @@ function App() {
         setBpmConfidence(e.payload.confidence);
       }),
       listen<string>("engine:genre", (e) => setGenre(e.payload)),
+      listen<GenreScore[]>("engine:genre-scores", (e) => setGenreScores(e.payload)),
       listen<Palette>("engine:palette", (e) => setPalette(e.payload)),
       listen<LightFrame>("engine:lights", (e) => setLights(e.payload)),
       listen<BandBeatEvent>("engine:beat", (e) => {
-        setBeatFlash((prev) => ({ ...prev, [e.payload.band]: Date.now() }));
+        beatFlashRef.current[e.payload.band] = Date.now();
       }),
       listen<string>("engine:status-message", (e) => setMessage(e.payload)),
     ];
@@ -117,6 +350,80 @@ function App() {
     const next = { ...config, ...patch };
     setConfig(next);
     await invoke("set_config", { config: next });
+  };
+
+  // Fader drags fire continuously; update local state immediately but send
+  // to the backend at most every ~120 ms, plus a final send on release.
+  const applyAnalyzerLive = useCallback(
+    (patch: (a: AnalyzerSettings) => AnalyzerSettings, commit: boolean) => {
+      const base = pendingConfigRef.current ?? configRef.current;
+      if (!base) return;
+      const next = { ...base, analyzer: patch(base.analyzer) };
+      pendingConfigRef.current = next;
+      setConfig(next);
+      const flush = () => {
+        if (pendingConfigRef.current) {
+          invoke("set_config", { config: pendingConfigRef.current });
+        }
+      };
+      if (commit) {
+        if (sensSendTimer.current !== null) {
+          clearTimeout(sensSendTimer.current);
+          sensSendTimer.current = null;
+        }
+        flush();
+        pendingConfigRef.current = null;
+      } else if (sensSendTimer.current === null) {
+        sensSendTimer.current = window.setTimeout(() => {
+          sensSendTimer.current = null;
+          flush();
+        }, 120);
+      }
+    },
+    []
+  );
+
+  const applySensitivity = useCallback(
+    (index: number, sigma: number, commit: boolean) => {
+      applyAnalyzerLive((a) => {
+        const sensitivity = [...a.sensitivity] as [number, number, number, number];
+        sensitivity[index] = Math.round(sigma * 20) / 20;
+        return { ...a, sensitivity };
+      }, commit);
+    },
+    [applyAnalyzerLive]
+  );
+
+  const applyManualThreshold = useCallback(
+    (index: number, raw: number, commit: boolean) => {
+      applyAnalyzerLive((a) => {
+        const manual_threshold = [...a.manual_threshold] as [number, number, number, number];
+        // 4 significant digits keeps config.toml tidy.
+        manual_threshold[index] = Number(raw.toPrecision(4));
+        return { ...a, manual_threshold };
+      }, commit);
+    },
+    [applyAnalyzerLive]
+  );
+
+  const toggleAdvanced = (on: boolean) => {
+    setAdvancedMode(on);
+    localStorage.setItem("huebeat:advancedMode", on ? "1" : "0");
+  };
+
+  // Switching to manual freezes the threshold where the adaptive line sits
+  // right now (seamless); with no live frame the stored values remain and
+  // any unset (0) band keeps adaptive behavior on the backend.
+  const setThresholdMode = (mode: ThresholdMode) => {
+    if (!config) return;
+    const analyzer = { ...config.analyzer, threshold_mode: mode };
+    const frame = frameRef.current;
+    if (mode === "manual" && frame) {
+      analyzer.manual_threshold = frame.band_threshold.map((t, i) =>
+        Number((t * frame.band_flux_max[i]).toPrecision(4))
+      ) as [number, number, number, number];
+    }
+    updateConfig({ analyzer });
   };
 
   const start = async () => {
@@ -142,6 +449,7 @@ function App() {
     setRunning(false);
     setStreaming(false);
     setPanicState(null);
+    setGenreScores([]);
   };
 
   const discover = async () => {
@@ -204,13 +512,105 @@ function App() {
     updateConfig({ palette_override: value });
   };
 
-  const now = Date.now();
+  // ---- Palette editing ----------------------------------------------
+  // The genre whose palette is lighting the room right now: an override
+  // wins, otherwise the detected genre.
+  const activePaletteId = config?.palette_override ?? genre;
+
+  /** Keep the topbar swatches fresh when the edited genre is active. */
+  const syncActivePalette = (entry: PaletteEntry) => {
+    if (entry.genre === activePaletteId) setPalette(entry.palette);
+  };
+
+  const flushPalette = () => {
+    if (paletteSendTimer.current !== null) {
+      clearTimeout(paletteSendTimer.current);
+      paletteSendTimer.current = null;
+    }
+    const pending = pendingPaletteRef.current;
+    if (!pending) return;
+    pendingPaletteRef.current = null;
+    invoke("set_genre_palette", {
+      genreId: pending.genre,
+      name: pending.palette.name,
+      colors: pending.palette.colors.map(colorToHex),
+    });
+  };
+
+  // Color pickers fire continuously while dragging; update local state
+  // immediately but send to the backend at most every ~200 ms.
+  const applyPaletteColor = (entry: PaletteEntry, slot: number, hex: string) => {
+    const colors = entry.palette.colors.map((c, i) => (i === slot ? hexToColor(hex) : c));
+    const updated: PaletteEntry = {
+      genre: entry.genre,
+      palette: { ...entry.palette, colors },
+    };
+    setPalettes((ps) => ps.map((p) => (p.genre === entry.genre ? updated : p)));
+    syncActivePalette(updated);
+    if (pendingPaletteRef.current && pendingPaletteRef.current.genre !== entry.genre) {
+      flushPalette();
+    }
+    pendingPaletteRef.current = updated;
+    if (paletteSendTimer.current === null) {
+      paletteSendTimer.current = window.setTimeout(() => {
+        paletteSendTimer.current = null;
+        flushPalette();
+      }, 200);
+    }
+  };
+
+  const resetGenrePalette = async (genreId: string) => {
+    pendingPaletteRef.current = null;
+    const p = await invoke<Palette>("reset_genre_palette", { genreId });
+    const updated: PaletteEntry = { genre: genreId, palette: p };
+    setPalettes((ps) => ps.map((e) => (e.genre === genreId ? updated : e)));
+    syncActivePalette(updated);
+  };
+
+  // Two-step guard: the first click arms the button, a second click
+  // within 4 s actually resets every genre palette.
+  const resetAllPalettes = async () => {
+    if (!resetAllArmed) {
+      setResetAllArmed(true);
+      resetAllTimer.current = window.setTimeout(() => setResetAllArmed(false), 4000);
+      return;
+    }
+    if (resetAllTimer.current !== null) {
+      clearTimeout(resetAllTimer.current);
+      resetAllTimer.current = null;
+    }
+    setResetAllArmed(false);
+    pendingPaletteRef.current = null;
+    const entries = await invoke<PaletteEntry[]>("reset_all_palettes");
+    setPalettes(entries);
+    const active = entries.find((e) => e.genre === activePaletteId);
+    if (active) setPalette(active.palette);
+  };
+
+  const editEntry = palettes.find((p) => p.genre === editGenreId) ?? null;
 
   return (
     <main className="shell">
       <header className="topbar">
-        <div className="brand">
-          hue<span className="brand-accent">2</span>
+        <div className={`brand ${running ? "live" : ""}`}>
+          <svg className="brand-mark" viewBox="0 0 28 28" aria-hidden="true">
+            <defs>
+              <linearGradient id="brand-grad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stopColor="#ff2d78" />
+                <stop offset="100%" stopColor="#00d4ff" />
+              </linearGradient>
+            </defs>
+            <rect width="28" height="28" rx="8" fill="url(#brand-grad)" />
+            <g fill="#fff">
+              <rect className="eq eq1" x="4.75" y="15" width="3.5" height="8" rx="1.75" />
+              <rect className="eq eq2" x="9.75" y="8" width="3.5" height="15" rx="1.75" />
+              <rect className="eq eq3" x="14.75" y="12" width="3.5" height="11" rx="1.75" />
+              <rect className="eq eq4" x="19.75" y="17" width="3.5" height="6" rx="1.75" />
+            </g>
+          </svg>
+          <span className="brand-word">
+            hue<span className="brand-accent">beat</span>
+          </span>
         </div>
         <div className="bpm-box">
           <span className="bpm-value">{bpm > 0 ? bpm.toFixed(1) : "--"}</span>
@@ -236,18 +636,113 @@ function App() {
 
       <div className="grid">
         <section className="panel viz">
-          <h2>Analyzer</h2>
-          <Spectrum frameRef={frameRef} />
-          <div className="band-row">
-            {BANDS.map((b) => {
-              const active = now - (beatFlash[b] ?? 0) < 150;
-              return (
-                <div key={b} className={`band-indicator ${active ? "hit" : ""}`}>
-                  {BAND_LABELS[b]}
-                </div>
-              );
-            })}
+          <div className="panel-head">
+            <h2>Analyzer</h2>
+            <label className="check inline">
+              <input
+                type="checkbox"
+                checked={advancedMode}
+                onChange={(e) => toggleAdvanced(e.target.checked)}
+              />
+              詳細設定モード
+            </label>
           </div>
+          <Spectrum frameRef={frameRef} />
+          {config && (
+            <BandMeters
+              frameRef={frameRef}
+              beatFlashRef={beatFlashRef}
+              sensitivity={config.analyzer.sensitivity}
+              mode={config.analyzer.threshold_mode}
+              interactive={advancedMode}
+              onSensitivity={applySensitivity}
+              onManualThreshold={applyManualThreshold}
+            />
+          )}
+          <p className="hint">
+            {advancedMode
+              ? "メーター = 各帯域のオンセット量 / 黄ライン = 検出閾値(ドラッグで調整・超えるとビート発火)"
+              : "メーター = 各帯域のオンセット量 / 黄ライン = 検出閾値(自動調整・調整は詳細設定モード)"}
+          </p>
+          {genreScores.length > 0 && (
+            <div className="genre-scores">
+              <span className="genre-scores-label">ジャンル推定</span>
+              {genreScores.map(([id, share]) => (
+                <span key={id} className={`genre-score-chip ${id === genre ? "top" : ""}`}>
+                  {GENRE_LABELS[id] ?? id} <b>{Math.round(share * 100)}%</b>
+                </span>
+              ))}
+            </div>
+          )}
+          {advancedMode && config && (
+            <div className="advanced-settings">
+              <div className="mode-row">
+                <span className="field-label">閾値モード</span>
+                <label className="check inline">
+                  <input
+                    type="radio"
+                    name="threshold-mode"
+                    checked={config.analyzer.threshold_mode === "auto"}
+                    onChange={() => setThresholdMode("auto")}
+                  />
+                  自動(適応)
+                </label>
+                <label className="check inline">
+                  <input
+                    type="radio"
+                    name="threshold-mode"
+                    checked={config.analyzer.threshold_mode === "manual"}
+                    onChange={() => setThresholdMode("manual")}
+                  />
+                  手動(固定・入力ゲイン一定前提)
+                </label>
+              </div>
+              <p className="hint">
+                {config.analyzer.threshold_mode === "manual"
+                  ? "閾値は固定(音量変化に追従しません)。フェーダーで各帯域のレベルを直接設定 / 間隔: 連続発火を抑える最小時間"
+                  : "閾値: 低いほど敏感に発火 / 間隔: 同帯域の連続発火を抑える最小時間"}
+              </p>
+              {BANDS.map((b, i) => (
+                <div key={b} className="band-tune-row">
+                  <span className="band-tune-label">{BAND_LABELS[b]}</span>
+                  {config.analyzer.threshold_mode === "manual" ? (
+                    <span className="manual-note">閾値: フェーダーで調整</span>
+                  ) : (
+                    <label>
+                      閾値 {config.analyzer.sensitivity[i].toFixed(1)}σ
+                      <input
+                        type="range"
+                        min={0.5}
+                        max={6.0}
+                        step={0.1}
+                        value={config.analyzer.sensitivity[i]}
+                        onChange={(e) => {
+                          const sensitivity = [...config.analyzer.sensitivity] as [number, number, number, number];
+                          sensitivity[i] = Number(e.target.value);
+                          updateConfig({ analyzer: { ...config.analyzer, sensitivity } });
+                        }}
+                      />
+                    </label>
+                  )}
+                  <label>
+                    間隔 {Math.round(config.analyzer.min_interval_ms[i])}ms
+                    <input
+                      type="range"
+                      min={40}
+                      max={400}
+                      step={10}
+                      value={config.analyzer.min_interval_ms[i]}
+                      onChange={(e) => {
+                        const min_interval_ms = [...config.analyzer.min_interval_ms] as [number, number, number, number];
+                        min_interval_ms[i] = Number(e.target.value);
+                        updateConfig({ analyzer: { ...config.analyzer, min_interval_ms } });
+                      }}
+                    />
+                  </label>
+                </div>
+              ))}
+            </div>
+          )}
           <h2>Lights</h2>
           <div className="lights-row">
             {(lights?.channels ?? []).map(([id, c]) => (
@@ -367,6 +862,50 @@ function App() {
               ))}
             </select>
           </label>
+
+          <div className="palette-editor">
+            <div className="row">
+              <span className="field-label">パレット編集</span>
+              <select value={editGenreId} onChange={(e) => setEditGenreId(e.target.value)}>
+                {palettes.map((p) => (
+                  <option key={p.genre} value={p.genre}>
+                    {GENRE_LABELS[p.genre] ?? p.genre}
+                    {p.genre === activePaletteId ? " ●" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {editEntry && (
+              <>
+                <div className="palette-colors">
+                  {editEntry.palette.colors.map((c, i) => (
+                    <label key={i} className="palette-color">
+                      <input
+                        type="color"
+                        value={colorToHex(c)}
+                        onChange={(e) => applyPaletteColor(editEntry, i, e.target.value)}
+                      />
+                      <span>{i < BANDS.length ? BAND_LABELS[BANDS[i]] : `#${i + 1}`}</span>
+                    </label>
+                  ))}
+                </div>
+                <p className="hint">
+                  色は帯域に対応(LOW=キック等)。変更は即保存・適用されます
+                </p>
+                <div className="row">
+                  <button onClick={() => resetGenrePalette(editEntry.genre)}>
+                    既定色に戻す
+                  </button>
+                  <button
+                    className={resetAllArmed ? "danger" : ""}
+                    onClick={resetAllPalettes}
+                  >
+                    {resetAllArmed ? "もう一度クリックで実行" : "全ジャンルを既定に戻す"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </section>
 
         <section className="panel effects">
@@ -462,43 +1001,6 @@ function App() {
                   }
                 />
               </label>
-              <h2>ビート検出閾値</h2>
-              <p className="hint">閾値: 低いほど敏感に発火 / 間隔: 同帯域の連続発火を抑える最小時間</p>
-              {BANDS.map((b, i) => (
-                <div key={b} className="band-tune-row">
-                  <span className="band-tune-label">{BAND_LABELS[b]}</span>
-                  <label>
-                    閾値 {config.analyzer.sensitivity[i].toFixed(1)}σ
-                    <input
-                      type="range"
-                      min={1.0}
-                      max={4.0}
-                      step={0.1}
-                      value={config.analyzer.sensitivity[i]}
-                      onChange={(e) => {
-                        const sensitivity = [...config.analyzer.sensitivity] as [number, number, number, number];
-                        sensitivity[i] = Number(e.target.value);
-                        updateConfig({ analyzer: { ...config.analyzer, sensitivity } });
-                      }}
-                    />
-                  </label>
-                  <label>
-                    間隔 {Math.round(config.analyzer.min_interval_ms[i])}ms
-                    <input
-                      type="range"
-                      min={40}
-                      max={400}
-                      step={10}
-                      value={config.analyzer.min_interval_ms[i]}
-                      onChange={(e) => {
-                        const min_interval_ms = [...config.analyzer.min_interval_ms] as [number, number, number, number];
-                        min_interval_ms[i] = Number(e.target.value);
-                        updateConfig({ analyzer: { ...config.analyzer, min_interval_ms } });
-                      }}
-                    />
-                  </label>
-                </div>
-              ))}
               <label className="check">
                 <input
                   type="checkbox"

@@ -44,6 +44,18 @@ impl Default for BandConfig {
     }
 }
 
+/// How the beat-detection threshold is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdMode {
+    /// Adaptive: mean + sensitivity·std over recent flux (gain-robust).
+    #[default]
+    Auto,
+    /// Fixed per-band threshold in raw flux units; assumes constant
+    /// input gain. Bands with an unset (<= 0) value fall back to Auto.
+    Manual,
+}
+
 /// A beat (onset) detected in one frequency band.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BandBeatEvent {
@@ -68,6 +80,20 @@ pub struct AnalysisFrame {
     pub spectral_centroid: f32,
     /// Coarse spectrum (log-spaced bins, 0..1) for UI display.
     pub spectrum: Vec<f32>,
+    /// Per-band onset flux, normalized 0..1 against a slow-decay peak.
+    pub band_flux: [f32; 4],
+    /// Effective beat threshold (mean + sensitivity·std) on the same
+    /// normalized scale as `band_flux`, so the UI can draw it as a fader
+    /// over the live meter.
+    pub band_threshold: [f32; 4],
+    /// Running flux mean / std on the normalized scale; lets the UI map a
+    /// dragged fader position back to a sensitivity in σ.
+    pub band_flux_mean: [f32; 4],
+    pub band_flux_std: [f32; 4],
+    /// Raw (unnormalized) slow-decay flux peak per band — the scale factor
+    /// behind the normalized values above. Multiplying a 0..1 meter
+    /// position by this yields a threshold in raw flux units.
+    pub band_flux_max: [f32; 4],
 }
 
 /// Current tempo estimate.
@@ -95,32 +121,106 @@ pub enum TempoSource {
 pub enum Genre {
     DeepHouse,
     House,
+    TechHouse,
+    ElectroHouse,
+    NuDisco,
+    NetPop,
+    UkGarage,
+    JerseyClub,
     Techno,
     Trance,
+    Psytrance,
+    Hardstyle,
+    Eurobeat,
+    AnisonRemix,
+    Breakbeat,
     DrumAndBass,
     Dubstep,
+    Trap,
+    Hyperflip,
+    FutureBass,
+    FutureCore,
     Hardcore,
     KawaiiFutureBass,
     HipHop,
+    Rnb,
+    Reggaeton,
+    Synthwave,
     Ambient,
     Unknown,
 }
 
 impl Genre {
+    /// Every genre, in display / palette-list order.
+    pub const ALL: [Genre; 29] = [
+        Genre::DeepHouse,
+        Genre::House,
+        Genre::TechHouse,
+        Genre::ElectroHouse,
+        Genre::NuDisco,
+        Genre::NetPop,
+        Genre::UkGarage,
+        Genre::JerseyClub,
+        Genre::Techno,
+        Genre::Trance,
+        Genre::Psytrance,
+        Genre::Hardstyle,
+        Genre::Eurobeat,
+        Genre::AnisonRemix,
+        Genre::Breakbeat,
+        Genre::DrumAndBass,
+        Genre::Dubstep,
+        Genre::Trap,
+        Genre::Hyperflip,
+        Genre::FutureBass,
+        Genre::FutureCore,
+        Genre::Hardcore,
+        Genre::KawaiiFutureBass,
+        Genre::HipHop,
+        Genre::Rnb,
+        Genre::Reggaeton,
+        Genre::Synthwave,
+        Genre::Ambient,
+        Genre::Unknown,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Genre::DeepHouse => "deep_house",
             Genre::House => "house",
+            Genre::TechHouse => "tech_house",
+            Genre::ElectroHouse => "electro_house",
+            Genre::NuDisco => "nu_disco",
+            Genre::NetPop => "net_pop",
+            Genre::UkGarage => "uk_garage",
+            Genre::JerseyClub => "jersey_club",
             Genre::Techno => "techno",
             Genre::Trance => "trance",
+            Genre::Psytrance => "psytrance",
+            Genre::Hardstyle => "hardstyle",
+            Genre::Eurobeat => "eurobeat",
+            Genre::AnisonRemix => "anison_remix",
+            Genre::Breakbeat => "breakbeat",
             Genre::DrumAndBass => "drum_and_bass",
             Genre::Dubstep => "dubstep",
+            Genre::Trap => "trap",
+            Genre::Hyperflip => "hyperflip",
+            Genre::FutureBass => "future_bass",
+            Genre::FutureCore => "future_core",
             Genre::Hardcore => "hardcore",
             Genre::KawaiiFutureBass => "kawaii_future_bass",
             Genre::HipHop => "hip_hop",
+            Genre::Rnb => "rnb",
+            Genre::Reggaeton => "reggaeton",
+            Genre::Synthwave => "synthwave",
             Genre::Ambient => "ambient",
             Genre::Unknown => "unknown",
         }
+    }
+
+    /// Inverse of `as_str` (also matches the serde snake_case ids).
+    pub fn from_id(id: &str) -> Option<Genre> {
+        Self::ALL.iter().copied().find(|g| g.as_str() == id)
     }
 }
 

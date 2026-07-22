@@ -96,6 +96,7 @@ impl FeatureAggregator {
             .max(1) as f32;
         let per_sec = |count: usize| count as f32 * 1000.0 / span_ms;
         let kicks = self.beats.iter().filter(|b| b.band == Band::Low).count();
+        let snares = self.beats.iter().filter(|b| b.band == Band::HighMid).count();
         let hats = self.beats.iter().filter(|b| b.band == Band::High).count();
 
         // Inter-kick intervals: implied kick-grid BPM + how regular the
@@ -129,6 +130,7 @@ impl FeatureAggregator {
             bpm_confidence: self.last_tempo.map(|t| t.confidence).unwrap_or(0.0),
             band_energy,
             kick_density: per_sec(kicks),
+            snare_density: per_sec(snares),
             hat_density: per_sec(hats),
             kick_ibi_bpm,
             kick_regularity,
@@ -171,24 +173,6 @@ impl RunningEngine {
         *self.current_palette.lock().unwrap() = p.clone();
         self.effect.lock().unwrap().set_palette(p);
     }
-}
-
-fn genre_from_id(id: &str) -> Option<Genre> {
-    [
-        Genre::DeepHouse,
-        Genre::House,
-        Genre::Techno,
-        Genre::Trance,
-        Genre::DrumAndBass,
-        Genre::Dubstep,
-        Genre::Hardcore,
-        Genre::KawaiiFutureBass,
-        Genre::HipHop,
-        Genre::Ambient,
-        Genre::Unknown,
-    ]
-    .into_iter()
-    .find(|g| g.as_str() == id)
 }
 
 /// Start the full pipeline. Streaming to the bridge is attempted when the
@@ -246,7 +230,7 @@ pub async fn start(
     let override_genre = config
         .palette_override
         .as_deref()
-        .and_then(genre_from_id);
+        .and_then(Genre::from_id);
     let initial_genre = override_genre.unwrap_or(Genre::Unknown);
     let initial_palette = palettes.lock().unwrap().palette_for(initial_genre);
 
@@ -403,7 +387,16 @@ pub async fn start(
                         if auto_genre && last_genre_update.elapsed().as_millis() > 1000 {
                             last_genre_update = std::time::Instant::now();
                             if let Some(features) = aggregator.features() {
-                                if let Some(new_genre) = classifier.update(&features) {
+                                let changed = classifier.update(&features);
+                                // Top candidates (share of total score) so the
+                                // UI can show why a genre was picked.
+                                let ranked: Vec<(String, f32)> = classifier
+                                    .ranked(4)
+                                    .into_iter()
+                                    .map(|(g, s)| (g.as_str().to_string(), s))
+                                    .collect();
+                                let _ = app.emit("engine:genre-scores", &ranked);
+                                if let Some(new_genre) = changed {
                                     let p =
                                         palettes.lock().unwrap().palette_for(new_genre);
                                     *current_genre.lock().unwrap() = new_genre;
