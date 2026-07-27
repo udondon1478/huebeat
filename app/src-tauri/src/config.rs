@@ -13,6 +13,17 @@ pub struct AnalyzerSettings {
     pub min_interval_ms: [f32; 4],
     /// LightBeat-style "bass only" beat detection.
     pub low_only: bool,
+    // Per-field defaults: the struct has no container-level
+    // #[serde(default)], so an existing config.toml written before these
+    // keys existed must still parse (a failure would silently drop the
+    // whole file, including bridge pairing).
+    /// Adaptive (auto) vs fixed (manual) beat threshold.
+    #[serde(default)]
+    pub threshold_mode: core_types::ThresholdMode,
+    /// Fixed per-band threshold in raw flux units (manual mode);
+    /// <= 0 = unset, falls back to the adaptive threshold.
+    #[serde(default)]
+    pub manual_threshold: [f32; 4],
 }
 
 impl Default for AnalyzerSettings {
@@ -22,6 +33,8 @@ impl Default for AnalyzerSettings {
             sensitivity: d.sensitivity,
             min_interval_ms: d.min_interval_ms,
             low_only: d.low_only,
+            threshold_mode: d.threshold_mode,
+            manual_threshold: d.manual_threshold,
         }
     }
 }
@@ -33,6 +46,8 @@ impl AnalyzerSettings {
             sensitivity: self.sensitivity,
             min_interval_ms: self.min_interval_ms,
             low_only: self.low_only,
+            threshold_mode: self.threshold_mode,
+            manual_threshold: self.manual_threshold,
         }
     }
 }

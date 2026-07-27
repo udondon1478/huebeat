@@ -1,4 +1,4 @@
-//! Shared types flowing through the hue2 pipeline:
+//! Shared types flowing through the huebeat pipeline:
 //! audio capture -> analysis -> (genre, effects) -> hue-stream / osc.
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,18 @@ impl Default for BandConfig {
     }
 }
 
+/// How the beat-detection threshold is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdMode {
+    /// Adaptive: mean + sensitivity·std over recent flux (gain-robust).
+    #[default]
+    Auto,
+    /// Fixed per-band threshold in raw flux units; assumes constant
+    /// input gain. Bands with an unset (<= 0) value fall back to Auto.
+    Manual,
+}
+
 /// A beat (onset) detected in one frequency band.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BandBeatEvent {
@@ -68,6 +80,20 @@ pub struct AnalysisFrame {
     pub spectral_centroid: f32,
     /// Coarse spectrum (log-spaced bins, 0..1) for UI display.
     pub spectrum: Vec<f32>,
+    /// Per-band onset flux, normalized 0..1 against a slow-decay peak.
+    pub band_flux: [f32; 4],
+    /// Effective beat threshold (mean + sensitivity·std) on the same
+    /// normalized scale as `band_flux`, so the UI can draw it as a fader
+    /// over the live meter.
+    pub band_threshold: [f32; 4],
+    /// Running flux mean / std on the normalized scale; lets the UI map a
+    /// dragged fader position back to a sensitivity in σ.
+    pub band_flux_mean: [f32; 4],
+    pub band_flux_std: [f32; 4],
+    /// Raw (unnormalized) slow-decay flux peak per band — the scale factor
+    /// behind the normalized values above. Multiplying a 0..1 meter
+    /// position by this yields a threshold in raw flux units.
+    pub band_flux_max: [f32; 4],
 }
 
 /// Current tempo estimate.
@@ -89,39 +115,73 @@ pub enum TempoSource {
     Osc,
 }
 
-/// Music genre families used for palette selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Genre {
-    DeepHouse,
-    House,
-    Techno,
-    Trance,
-    DrumAndBass,
-    Dubstep,
-    Hardcore,
-    KawaiiFutureBass,
-    HipHop,
-    Ambient,
-    Unknown,
+/// Declares the `Genre` enum together with `ALL`, `as_str`, `from_id` and
+/// the serde ids from one list, so a new genre cannot be half-added: the
+/// list is the only place to edit, and forgetting it in `ALL` (which used
+/// to compile fine and silently drop the genre from the palette UI and
+/// from `palettes.toml` loading) is no longer possible.
+macro_rules! genres {
+    ($($variant:ident => $id:literal),+ $(,)?) => {
+        /// Music genre families used for palette selection.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum Genre {
+            $(
+                #[serde(rename = $id)]
+                $variant,
+            )+
+        }
+
+        impl Genre {
+            /// Every genre, in display / palette-list order.
+            pub const ALL: &'static [Genre] = &[$(Genre::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Genre::$variant => $id,)+
+                }
+            }
+
+            /// Inverse of `as_str` (also matches the serde ids).
+            pub fn from_id(id: &str) -> Option<Genre> {
+                match id {
+                    $($id => Some(Genre::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
 }
 
-impl Genre {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Genre::DeepHouse => "deep_house",
-            Genre::House => "house",
-            Genre::Techno => "techno",
-            Genre::Trance => "trance",
-            Genre::DrumAndBass => "drum_and_bass",
-            Genre::Dubstep => "dubstep",
-            Genre::Hardcore => "hardcore",
-            Genre::KawaiiFutureBass => "kawaii_future_bass",
-            Genre::HipHop => "hip_hop",
-            Genre::Ambient => "ambient",
-            Genre::Unknown => "unknown",
-        }
-    }
+genres! {
+    DeepHouse => "deep_house",
+    House => "house",
+    TechHouse => "tech_house",
+    ElectroHouse => "electro_house",
+    NuDisco => "nu_disco",
+    NetPop => "net_pop",
+    UkGarage => "uk_garage",
+    JerseyClub => "jersey_club",
+    Techno => "techno",
+    Trance => "trance",
+    Psytrance => "psytrance",
+    Hardstyle => "hardstyle",
+    Eurobeat => "eurobeat",
+    AnisonRemix => "anison_remix",
+    Breakbeat => "breakbeat",
+    DrumAndBass => "drum_and_bass",
+    Dubstep => "dubstep",
+    Trap => "trap",
+    Hyperflip => "hyperflip",
+    FutureBass => "future_bass",
+    FutureCore => "future_core",
+    Hardcore => "hardcore",
+    KawaiiFutureBass => "kawaii_future_bass",
+    HipHop => "hip_hop",
+    Rnb => "rnb",
+    Reggaeton => "reggaeton",
+    Synthwave => "synthwave",
+    Ambient => "ambient",
+    Unknown => "unknown",
 }
 
 /// sRGB color, 0..255.
@@ -202,4 +262,31 @@ pub enum EngineEvent {
     Tempo(TempoEstimate),
     GenreChanged { genre: Genre },
     PaletteChanged { palette: Palette },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL`, `as_str`, `from_id` and the serde id all come from one macro
+    /// list; this pins the contract the palette store and the UI rely on.
+    #[test]
+    fn genre_ids_roundtrip() {
+        for &g in Genre::ALL {
+            assert_eq!(Genre::from_id(g.as_str()), Some(g), "{g:?}");
+            let json = serde_json::to_string(&g).unwrap();
+            assert_eq!(json, format!("\"{}\"", g.as_str()), "{g:?}");
+            assert_eq!(serde_json::from_str::<Genre>(&json).unwrap(), g);
+        }
+        assert_eq!(Genre::from_id("not_a_genre"), None);
+    }
+
+    #[test]
+    fn genre_ids_are_unique() {
+        let mut ids: Vec<&str> = Genre::ALL.iter().map(|g| g.as_str()).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "duplicate genre id");
+    }
 }

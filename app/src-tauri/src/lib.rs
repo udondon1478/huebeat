@@ -58,7 +58,7 @@ enum PairResult {
 
 #[tauri::command]
 async fn pair_bridge(state: State<'_, AppState>, ip: String) -> Result<PairResult, String> {
-    match hue_client::pair(&ip, "hue2#desktop").await {
+    match hue_client::pair(&ip, "huebeat#desktop").await {
         Ok(bridge) => {
             state.config.lock().unwrap().bridge = Some(bridge.clone());
             state.save_config();
@@ -89,13 +89,20 @@ fn get_config(state: State<'_, AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
+/// Store + live-apply a config. `persist` = Some(false) skips the TOML
+/// write: fader drags call this many times per second (throttled in the UI)
+/// and each write is a synchronous `fs::write` on the command thread, so
+/// intermediate positions stay in memory only and the UI sends a final
+/// `persist: true` call on release. Omitting the flag persists.
 #[tauri::command]
-fn set_config(state: State<'_, AppState>, config: AppConfig) {
+fn set_config(state: State<'_, AppState>, config: AppConfig, persist: Option<bool>) {
     {
         let mut cfg = state.config.lock().unwrap();
         *cfg = config;
     }
-    state.save_config();
+    if persist.unwrap_or(true) {
+        state.save_config();
+    }
     // Live-apply effect + analyzer settings when running.
     let cfg = state.config.lock().unwrap().clone();
     if let Some(engine) = state.engine.lock().unwrap().as_ref() {
@@ -113,26 +120,27 @@ struct PaletteEntry {
 #[tauri::command]
 fn get_palettes(state: State<'_, AppState>) -> Vec<PaletteEntry> {
     let store = state.palettes.lock().unwrap();
-    let mut out: Vec<PaletteEntry> = store
-        .genre_map
+    core_types::Genre::ALL
         .iter()
-        .map(|(g, p)| PaletteEntry {
+        .map(|&g| PaletteEntry {
             genre: g.as_str().to_string(),
-            palette: p.clone(),
+            palette: store.palette_for(g),
         })
-        .collect();
-    out.sort_by(|a, b| a.genre.cmp(&b.genre));
-    out
+        .collect()
 }
 
+/// Store + live-apply one genre palette. As with `set_config`, `persist` =
+/// Some(false) keeps a color-picker drag out of the filesystem; the UI
+/// persists once the picker is released.
 #[tauri::command]
 fn set_genre_palette(
     state: State<'_, AppState>,
     genre_id: String,
     name: String,
     colors: Vec<String>,
+    persist: Option<bool>,
 ) -> Result<(), String> {
-    let genre = genre_id_to_genre(&genre_id).ok_or("unknown genre")?;
+    let genre = core_types::Genre::from_id(&genre_id).ok_or("unknown genre")?;
     let colors: Vec<Color> = colors
         .iter()
         .filter_map(|h| Color::from_hex(h))
@@ -147,33 +155,61 @@ fn set_genre_palette(
         .unwrap()
         .genre_map
         .insert(genre, palette.clone());
-    state.save_palettes();
-    // Live-apply if this genre is currently active.
-    if let Some(engine) = state.engine.lock().unwrap().as_ref() {
-        if *engine.current_genre.lock().unwrap() == genre {
-            engine.set_palette(palette);
-        }
+    if persist.unwrap_or(true) {
+        state.save_palettes();
     }
+    apply_palette_if_active(&state, genre, &palette);
     Ok(())
 }
 
-fn genre_id_to_genre(id: &str) -> Option<core_types::Genre> {
-    use core_types::Genre::*;
-    [
-        DeepHouse,
-        House,
-        Techno,
-        Trance,
-        DrumAndBass,
-        Dubstep,
-        Hardcore,
-        KawaiiFutureBass,
-        HipHop,
-        Ambient,
-        Unknown,
-    ]
-    .into_iter()
-    .find(|g| g.as_str() == id)
+/// Live-apply a palette when its genre is the one currently lighting the
+/// room (either detected or forced by override).
+///
+/// Lock-order rule for everything that touches both mutexes: read
+/// `state.palettes` first and release it, *then* take `state.engine`. Never
+/// lock `palettes` while holding `engine` — the palette must already be in
+/// hand when this is called.
+fn apply_palette_if_active(state: &AppState, genre: core_types::Genre, palette: &Palette) {
+    if let Some(engine) = state.engine.lock().unwrap().as_ref() {
+        if *engine.current_genre.lock().unwrap() == genre {
+            engine.set_palette(palette.clone());
+        }
+    }
+}
+
+/// Genre currently lighting the room, or None when the engine is stopped.
+fn active_genre(state: &AppState) -> Option<core_types::Genre> {
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|e| *e.current_genre.lock().unwrap())
+}
+
+#[tauri::command]
+fn reset_genre_palette(
+    state: State<'_, AppState>,
+    genre_id: String,
+) -> Result<Palette, String> {
+    let genre = core_types::Genre::from_id(&genre_id).ok_or("unknown genre")?;
+    let palette = state.palettes.lock().unwrap().reset_genre(genre);
+    state.save_palettes();
+    apply_palette_if_active(&state, genre, &palette);
+    Ok(palette)
+}
+
+#[tauri::command]
+fn reset_all_palettes(state: State<'_, AppState>) -> Vec<PaletteEntry> {
+    state.palettes.lock().unwrap().reset_all();
+    state.save_palettes();
+    // Resolve genre + palette before taking the engine lock (see the
+    // lock-order rule on `apply_palette_if_active`).
+    if let Some(genre) = active_genre(&state) {
+        let p = state.palettes.lock().unwrap().palette_for(genre);
+        apply_palette_if_active(&state, genre, &p);
+    }
+    get_palettes(state)
 }
 
 #[tauri::command]
@@ -183,9 +219,10 @@ fn set_palette_override(state: State<'_, AppState>, genre_id: Option<String>) {
         cfg.palette_override = genre_id.clone();
     }
     state.save_config();
-    if let (Some(id), Some(engine)) = (genre_id, state.engine.lock().unwrap().as_ref()) {
-        if let Some(g) = genre_id_to_genre(&id) {
-            let p = state.palettes.lock().unwrap().palette_for(g);
+    // Palette first, engine second (see `apply_palette_if_active`).
+    if let Some(g) = genre_id.as_deref().and_then(core_types::Genre::from_id) {
+        let p = state.palettes.lock().unwrap().palette_for(g);
+        if let Some(engine) = state.engine.lock().unwrap().as_ref() {
             engine.set_palette(p);
         }
     }
@@ -305,6 +342,8 @@ pub fn run() {
             set_config,
             get_palettes,
             set_genre_palette,
+            reset_genre_palette,
+            reset_all_palettes,
             set_palette_override,
             set_panic,
             start_engine,
