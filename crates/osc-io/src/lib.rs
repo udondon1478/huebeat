@@ -1,7 +1,8 @@
 //! OSC output: broadcasts BPM, beats, genre and palette changes so
-//! external VJ tools (Resolume, TouchDesigner, ...) can follow hue2.
+//! external VJ tools (Resolume, TouchDesigner, ...) can follow huebeat.
 //!
-//! Address space:
+//! Address space — the `/hue2` prefix predates the rename and is kept so
+//! existing Resolume / TouchDesigner mappings keep working:
 //!   /hue2/bpm        (f)    current BPM
 //!   /hue2/beat       (s f)  band name, strength — fired per detected beat
 //!   /hue2/intensity  (f)    loudness envelope 0..1

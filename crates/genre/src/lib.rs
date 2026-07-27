@@ -483,7 +483,9 @@ impl RuleBasedClassifier {
             .filter(|(_, s)| **s > 0.01)
             .map(|(g, s)| (*g, *s / total))
             .collect();
-        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Genre id breaks exact ties so equal-scoring candidates keep a
+        // stable order instead of reshuffling the UI chips every second.
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
         v.truncate(n);
         v
     }
@@ -499,10 +501,15 @@ impl GenreClassifier for RuleBasedClassifier {
             *self.scores.entry(g).or_insert(0.0) += s;
         }
 
+        // Ties break on genre id (alphabetically first wins) so that
+        // HashMap iteration order can't make classification nondeterministic.
         let (&best, &best_score) = self
             .scores
             .iter()
-            .max_by(|a, b| a.1.total_cmp(b.1))
+            .max_by(|a, b| {
+                a.1.total_cmp(b.1)
+                    .then_with(|| b.0.as_str().cmp(a.0.as_str()))
+            })
             .unwrap_or((&Genre::Unknown, &0.0));
 
         if best_score < 0.5 {
@@ -910,6 +917,30 @@ mod tests {
         // Shares are descending.
         for w in ranked.windows(2) {
             assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    /// The ratio margin (`best > current * 1.4 + 0.2`) must not deadlock on
+    /// structurally close genre pairs: because unfed scores decay 0.82 per
+    /// update, a sustained change still clears the margin. Measured worst
+    /// case here is ~24 updates (~24 s); the bound guards future retunes
+    /// against turning hysteresis into permanent stickiness.
+    #[test]
+    fn structurally_close_genres_still_switch() {
+        for (name, from, to) in [
+            ("deep_house->house_128", deep_house(), house_128()),
+            ("house_128->net_pop", house_128(), net_pop()),
+            ("net_pop->anison_remix", net_pop(), anison_remix()),
+        ] {
+            let mut c = RuleBasedClassifier::default();
+            feed(&mut c, &from, 20);
+            let start = c.current();
+            let switched = (0..35).find_map(|_| c.update(&to));
+            assert!(
+                switched.is_some(),
+                "{name}: stuck on {start:?} for 35 updates (ranked {:?})",
+                c.ranked(3)
+            );
         }
     }
 

@@ -89,13 +89,20 @@ fn get_config(state: State<'_, AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
+/// Store + live-apply a config. `persist` = Some(false) skips the TOML
+/// write: fader drags call this many times per second (throttled in the UI)
+/// and each write is a synchronous `fs::write` on the command thread, so
+/// intermediate positions stay in memory only and the UI sends a final
+/// `persist: true` call on release. Omitting the flag persists.
 #[tauri::command]
-fn set_config(state: State<'_, AppState>, config: AppConfig) {
+fn set_config(state: State<'_, AppState>, config: AppConfig, persist: Option<bool>) {
     {
         let mut cfg = state.config.lock().unwrap();
         *cfg = config;
     }
-    state.save_config();
+    if persist.unwrap_or(true) {
+        state.save_config();
+    }
     // Live-apply effect + analyzer settings when running.
     let cfg = state.config.lock().unwrap().clone();
     if let Some(engine) = state.engine.lock().unwrap().as_ref() {
@@ -122,12 +129,16 @@ fn get_palettes(state: State<'_, AppState>) -> Vec<PaletteEntry> {
         .collect()
 }
 
+/// Store + live-apply one genre palette. As with `set_config`, `persist` =
+/// Some(false) keeps a color-picker drag out of the filesystem; the UI
+/// persists once the picker is released.
 #[tauri::command]
 fn set_genre_palette(
     state: State<'_, AppState>,
     genre_id: String,
     name: String,
     colors: Vec<String>,
+    persist: Option<bool>,
 ) -> Result<(), String> {
     let genre = core_types::Genre::from_id(&genre_id).ok_or("unknown genre")?;
     let colors: Vec<Color> = colors
@@ -144,19 +155,36 @@ fn set_genre_palette(
         .unwrap()
         .genre_map
         .insert(genre, palette.clone());
-    state.save_palettes();
+    if persist.unwrap_or(true) {
+        state.save_palettes();
+    }
     apply_palette_if_active(&state, genre, &palette);
     Ok(())
 }
 
 /// Live-apply a palette when its genre is the one currently lighting the
 /// room (either detected or forced by override).
+///
+/// Lock-order rule for everything that touches both mutexes: read
+/// `state.palettes` first and release it, *then* take `state.engine`. Never
+/// lock `palettes` while holding `engine` — the palette must already be in
+/// hand when this is called.
 fn apply_palette_if_active(state: &AppState, genre: core_types::Genre, palette: &Palette) {
     if let Some(engine) = state.engine.lock().unwrap().as_ref() {
         if *engine.current_genre.lock().unwrap() == genre {
             engine.set_palette(palette.clone());
         }
     }
+}
+
+/// Genre currently lighting the room, or None when the engine is stopped.
+fn active_genre(state: &AppState) -> Option<core_types::Genre> {
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|e| *e.current_genre.lock().unwrap())
 }
 
 #[tauri::command]
@@ -175,10 +203,11 @@ fn reset_genre_palette(
 fn reset_all_palettes(state: State<'_, AppState>) -> Vec<PaletteEntry> {
     state.palettes.lock().unwrap().reset_all();
     state.save_palettes();
-    if let Some(engine) = state.engine.lock().unwrap().as_ref() {
-        let genre = *engine.current_genre.lock().unwrap();
+    // Resolve genre + palette before taking the engine lock (see the
+    // lock-order rule on `apply_palette_if_active`).
+    if let Some(genre) = active_genre(&state) {
         let p = state.palettes.lock().unwrap().palette_for(genre);
-        engine.set_palette(p);
+        apply_palette_if_active(&state, genre, &p);
     }
     get_palettes(state)
 }
@@ -190,9 +219,10 @@ fn set_palette_override(state: State<'_, AppState>, genre_id: Option<String>) {
         cfg.palette_override = genre_id.clone();
     }
     state.save_config();
-    if let (Some(id), Some(engine)) = (genre_id, state.engine.lock().unwrap().as_ref()) {
-        if let Some(g) = core_types::Genre::from_id(&id) {
-            let p = state.palettes.lock().unwrap().palette_for(g);
+    // Palette first, engine second (see `apply_palette_if_active`).
+    if let Some(g) = genre_id.as_deref().and_then(core_types::Genre::from_id) {
+        let p = state.palettes.lock().unwrap().palette_for(g);
+        if let Some(engine) = state.engine.lock().unwrap().as_ref() {
             engine.set_palette(p);
         }
     }

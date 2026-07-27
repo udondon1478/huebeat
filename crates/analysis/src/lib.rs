@@ -277,9 +277,19 @@ impl Analyzer {
                 auto_threshold
             };
             // Normalize flux + threshold onto a shared 0..1 scale for the UI
-            // fader; the slow-decay peak tracks both so the fader line always
-            // stays within the visible meter.
-            band.flux_max = (band.flux_max * 0.9995).max(flux).max(threshold).max(1e-6);
+            // fader. In Auto mode the slow-decay peak tracks both, so the
+            // adaptive line always stays within the visible meter. In Manual
+            // mode the scale must not move on its own: with decay, a fixed
+            // raw threshold would appear to drift upward, and folding the
+            // threshold into the peak would permanently crush the flux bars
+            // whenever the user parks the line above the signal. So while
+            // manual, the denominator only ever grows to fit a new signal
+            // peak — a pinned line stays pinned.
+            band.flux_max = if manual {
+                band.flux_max.max(flux).max(1e-6)
+            } else {
+                (band.flux_max * 0.9995).max(flux).max(threshold).max(1e-6)
+            };
             ui_flux[bi] = (flux / band.flux_max).clamp(0.0, 1.0);
             ui_threshold[bi] = (threshold / band.flux_max).clamp(0.0, 1.0);
             ui_mean[bi] = (mean / band.flux_max).clamp(0.0, 1.0);
@@ -572,6 +582,41 @@ mod tests {
         let (beats, _) = run_with(cfg, &audio);
         let low = beats.iter().filter(|b| b.band == Band::Low).count();
         assert_eq!(low, 0, "threshold far above peak must never fire, got {low}");
+    }
+
+    /// In Manual mode the fixed line must stay where the user put it even
+    /// when the music gets quieter, and parking it above the signal must not
+    /// rescale (crush) the flux bars.
+    #[test]
+    fn manual_threshold_line_does_not_drift() {
+        let mut audio = beat_track(120.0, 55.0, 12.0);
+        let half = audio.len() / 2;
+        for s in &mut audio[half..] {
+            *s *= 0.3; // the room gets quieter — the peak would decay away
+        }
+        let (_, frames) = run_with(AnalyzerConfig::default(), &audio);
+        let peak = frames
+            .iter()
+            .map(|f| f.band_flux[0] * f.band_flux_max[0])
+            .fold(0.0f32, f32::max);
+
+        let mut cfg = AnalyzerConfig::default();
+        cfg.threshold_mode = ThresholdMode::Manual;
+        cfg.manual_threshold = [peak * 0.5, 0.0, 0.0, 0.0];
+        let (_, frames) = run_with(cfg.clone(), &audio);
+        // Skip the warm-up where the peak is still being learned.
+        let tail = &frames[frames.len() / 4..];
+        let lo = tail.iter().map(|f| f.band_threshold[0]).fold(f32::MAX, f32::min);
+        let hi = tail.iter().map(|f| f.band_threshold[0]).fold(0.0f32, f32::max);
+        assert!(hi - lo < 0.02, "manual line drifted over {lo}..{hi}");
+
+        cfg.manual_threshold[0] = peak * 10.0;
+        let (_, frames) = run_with(cfg, &audio);
+        let scale = frames.last().unwrap().band_flux_max[0];
+        assert!(
+            scale < peak * 1.5,
+            "a threshold above the signal must not inflate the meter scale: {scale} vs peak {peak}"
+        );
     }
 
     #[test]

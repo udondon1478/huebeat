@@ -436,13 +436,6 @@ label.check.inline input {
   flex: 0 0 auto;
 }
 
-.manual-note {
-  font-size: 11px;
-  color: var(--text-dim);
-  padding-bottom: 10px;
-  align-self: end;
-}
-
 /* ---- genre candidate readout ---- */
 .genre-scores {
   display: flex;

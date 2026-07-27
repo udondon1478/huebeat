@@ -30,6 +30,26 @@ function hexToColor(hex: string): Color {
   return { r: (v >> 16) & 0xff, g: (v >> 8) & 0xff, b: v & 0xff };
 }
 
+/**
+ * Match the canvas backing store to its CSS box × devicePixelRatio and
+ * return the CSS-pixel drawing size. Both canvases are laid out with
+ * `width: 100%`, so without this they would be stretched from a fixed
+ * bitmap and look soft on HiDPI or wide layouts.
+ */
+function fitCanvas(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
+  const dpr = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth || canvas.width;
+  const height = canvas.clientHeight || canvas.height;
+  const bw = Math.round(width * dpr);
+  const bh = Math.round(height * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { width, height };
+}
+
 function Spectrum({ frameRef }: { frameRef: React.MutableRefObject<AnalysisFrame | null> }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
@@ -41,7 +61,7 @@ function Spectrum({ frameRef }: { frameRef: React.MutableRefObject<AnalysisFrame
       if (!canvas) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      const { width, height } = canvas;
+      const { width, height } = fitCanvas(canvas, ctx);
       ctx.clearRect(0, 0, width, height);
       if (!frame) return;
       const n = frame.spectrum.length;
@@ -58,6 +78,16 @@ function Spectrum({ frameRef }: { frameRef: React.MutableRefObject<AnalysisFrame
     return () => cancelAnimationFrame(raf);
   }, [frameRef]);
   return <canvas ref={canvasRef} width={560} height={140} className="spectrum" />;
+}
+
+/**
+ * Arrow-key step for a manual threshold: raw flux magnitudes vary wildly
+ * between bands and gain settings, so ~5% of the current value keeps the
+ * number input usable at any scale.
+ */
+function manualStep(value: number): number {
+  if (!(value > 0)) return 0.1;
+  return Number((value / 20).toPrecision(1));
 }
 
 const SIGMA_MIN = 0.5;
@@ -89,10 +119,17 @@ function BandMeters({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragRef = useRef<{ band: number; p: number } | null>(null);
+  // Mirrored into refs (in an effect, not during render) so the rAF draw
+  // loop and the pointer handlers can read the latest props without being
+  // torn down and rebuilt on every change.
   const sensRef = useRef(sensitivity);
-  sensRef.current = sensitivity;
   const modeRef = useRef(mode);
-  modeRef.current = mode;
+  useEffect(() => {
+    sensRef.current = sensitivity;
+  }, [sensitivity]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   // A mode / interactivity switch mid-drag would leave a stale grab behind.
   useEffect(() => {
@@ -107,7 +144,7 @@ function BandMeters({
       if (!canvas) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      const { width, height } = canvas;
+      const { width, height } = fitCanvas(canvas, ctx);
       const frame = frameRef.current;
       const now = Date.now();
       ctx.clearRect(0, 0, width, height);
@@ -192,14 +229,14 @@ function BandMeters({
     return () => cancelAnimationFrame(raf);
   }, [frameRef, beatFlashRef]);
 
+  // Pointer coordinates are CSS pixels, the same space the draw loop uses.
   const posFromEvent = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
-    const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
-    const band = Math.min(3, Math.max(0, Math.floor(x / (canvas.width / 4))));
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const band = Math.min(3, Math.max(0, Math.floor(x / (rect.width / 4))));
     const meterTop = 4;
-    const meterBottom = canvas.height - 20;
+    const meterBottom = rect.height - 20;
     const p = (meterBottom - y) / (meterBottom - meterTop);
     return { band, p: Math.min(1, Math.max(0.02, p)) };
   };
@@ -287,22 +324,54 @@ function App() {
   const [manualIp, setManualIp] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [panic, setPanicState] = useState<string | null>(null);
-  const [advancedMode, setAdvancedMode] = useState(
-    () =>
-      (localStorage.getItem("huebeat:advancedMode") ??
-        localStorage.getItem("hue2:advancedMode")) === "1"
-  );
+  const [advancedMode, setAdvancedMode] = useState(() => {
+    // One-time migration off the pre-rename key, which is then dropped so it
+    // doesn't linger in localStorage forever.
+    const legacy = localStorage.getItem("hue2:advancedMode");
+    if (legacy !== null) {
+      if (localStorage.getItem("huebeat:advancedMode") === null) {
+        localStorage.setItem("huebeat:advancedMode", legacy);
+      }
+      localStorage.removeItem("hue2:advancedMode");
+    }
+    return localStorage.getItem("huebeat:advancedMode") === "1";
+  });
 
   const frameRef = useRef<AnalysisFrame | null>(null);
   const beatFlashRef = useRef<Record<string, number>>({});
   const pairingRef = useRef(false);
-  const sensSendTimer = useRef<number | null>(null);
+  const configSendTimer = useRef<number | null>(null);
+  const configCommitTimer = useRef<number | null>(null);
   const pendingConfigRef = useRef<AppConfig | null>(null);
   const configRef = useRef<AppConfig | null>(null);
-  configRef.current = config;
   const paletteSendTimer = useRef<number | null>(null);
+  const paletteCommitTimer = useRef<number | null>(null);
   const pendingPaletteRef = useRef<PaletteEntry | null>(null);
   const resetAllTimer = useRef<number | null>(null);
+
+  // Mirror config into a ref in an effect (not during render) for the
+  // throttled fader path, which needs the latest config without re-creating
+  // its callbacks.
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  // Drop any in-flight throttle/debounce timers on unmount.
+  useEffect(
+    () => () => {
+      for (const t of [
+        configSendTimer,
+        configCommitTimer,
+        paletteSendTimer,
+        paletteCommitTimer,
+        resetAllTimer,
+      ]) {
+        if (t.current !== null) clearTimeout(t.current);
+        t.current = null;
+      }
+    },
+    []
+  );
 
   const refreshAreas = useCallback(async () => {
     try {
@@ -345,43 +414,88 @@ function App() {
     };
   }, [loadConfig]);
 
-  const updateConfig = async (patch: Partial<AppConfig>) => {
-    if (!config) return;
-    const next = { ...config, ...patch };
-    setConfig(next);
-    await invoke("set_config", { config: next });
+  const clearConfigTimers = () => {
+    if (configSendTimer.current !== null) {
+      clearTimeout(configSendTimer.current);
+      configSendTimer.current = null;
+    }
+    if (configCommitTimer.current !== null) {
+      clearTimeout(configCommitTimer.current);
+      configCommitTimer.current = null;
+    }
   };
 
-  // Fader drags fire continuously; update local state immediately but send
-  // to the backend at most every ~120 ms, plus a final send on release.
-  const applyAnalyzerLive = useCallback(
-    (patch: (a: AnalyzerSettings) => AnalyzerSettings, commit: boolean) => {
+  /**
+   * Continuous controls (meter faders, sliders) call this on every change:
+   * local state updates immediately, the backend live-applies at most every
+   * ~120 ms with `persist: false` (in-memory only), and `commit` performs the
+   * single write to config.toml. Without this a drag would issue a
+   * synchronous `fs::write` on the Tauri command thread several times per
+   * second — mid-set, while the lights are running.
+   */
+  const applyConfigLive = useCallback(
+    (patch: (c: AppConfig) => AppConfig, commit: boolean) => {
       const base = pendingConfigRef.current ?? configRef.current;
       if (!base) return;
-      const next = { ...base, analyzer: patch(base.analyzer) };
+      const next = patch(base);
       pendingConfigRef.current = next;
       setConfig(next);
-      const flush = () => {
+      const flush = (persist: boolean) => {
         if (pendingConfigRef.current) {
-          invoke("set_config", { config: pendingConfigRef.current });
+          invoke("set_config", { config: pendingConfigRef.current, persist });
         }
       };
       if (commit) {
-        if (sensSendTimer.current !== null) {
-          clearTimeout(sensSendTimer.current);
-          sensSendTimer.current = null;
+        if (configSendTimer.current !== null) {
+          clearTimeout(configSendTimer.current);
+          configSendTimer.current = null;
         }
-        flush();
+        flush(true);
         pendingConfigRef.current = null;
-      } else if (sensSendTimer.current === null) {
-        sensSendTimer.current = window.setTimeout(() => {
-          sensSendTimer.current = null;
-          flush();
+      } else if (configSendTimer.current === null) {
+        configSendTimer.current = window.setTimeout(() => {
+          configSendTimer.current = null;
+          flush(false);
         }, 120);
       }
     },
     []
   );
+
+  const applyAnalyzerLive = useCallback(
+    (patch: (a: AnalyzerSettings) => AnalyzerSettings, commit: boolean) =>
+      applyConfigLive((c) => ({ ...c, analyzer: patch(c.analyzer) }), commit),
+    [applyConfigLive]
+  );
+
+  /**
+   * Discrete setting change (select / checkbox / number entry): persists
+   * immediately. It also supersedes any throttled slider value still waiting
+   * to be sent, so a pending drag can't flush stale values over this update.
+   */
+  const updateConfig = async (patch: Partial<AppConfig>) => {
+    const base = pendingConfigRef.current ?? config;
+    if (!base) return;
+    clearConfigTimers();
+    pendingConfigRef.current = null;
+    const next = { ...base, ...patch };
+    setConfig(next);
+    await invoke("set_config", { config: next, persist: true });
+  };
+
+  /**
+   * Slider drag: live-apply through the throttle, then persist once the value
+   * settles. Range inputs have no reliable "release" event, so the settle
+   * timer is what turns a whole drag into one disk write.
+   */
+  const updateConfigLive = (patch: Partial<AppConfig>) => {
+    applyConfigLive((c) => ({ ...c, ...patch }), false);
+    if (configCommitTimer.current !== null) clearTimeout(configCommitTimer.current);
+    configCommitTimer.current = window.setTimeout(() => {
+      configCommitTimer.current = null;
+      applyConfigLive((c) => c, true);
+    }, 500);
+  };
 
   const applySensitivity = useCallback(
     (index: number, sigma: number, commit: boolean) => {
@@ -522,23 +636,62 @@ function App() {
     if (entry.genre === activePaletteId) setPalette(entry.palette);
   };
 
-  const flushPalette = () => {
+  const sendPalette = useCallback((entry: PaletteEntry, persist: boolean) =>
+    invoke("set_genre_palette", {
+      genreId: entry.genre,
+      name: entry.palette.name,
+      colors: entry.palette.colors.map(colorToHex),
+      persist,
+    }), []);
+
+  const clearPaletteTimers = useCallback(() => {
     if (paletteSendTimer.current !== null) {
       clearTimeout(paletteSendTimer.current);
       paletteSendTimer.current = null;
     }
+    if (paletteCommitTimer.current !== null) {
+      clearTimeout(paletteCommitTimer.current);
+      paletteCommitTimer.current = null;
+    }
+  }, []);
+
+  /** Write the last edited palette to palettes.toml. */
+  const commitPalette = useCallback(() => {
+    clearPaletteTimers();
     const pending = pendingPaletteRef.current;
-    if (!pending) return;
     pendingPaletteRef.current = null;
-    invoke("set_genre_palette", {
-      genreId: pending.genre,
-      name: pending.palette.name,
-      colors: pending.palette.colors.map(colorToHex),
-    });
+    if (pending) sendPalette(pending, true);
+  }, [clearPaletteTimers, sendPalette]);
+
+  // A settle timer must not outlive the gesture: releasing the pointer or
+  // leaving the window writes the pending value out now, so closing the app
+  // right after a drag can't lose it.
+  useEffect(() => {
+    const commitNow = () => {
+      if (configCommitTimer.current !== null) {
+        clearTimeout(configCommitTimer.current);
+        configCommitTimer.current = null;
+        applyConfigLive((c) => c, true);
+      }
+      if (paletteCommitTimer.current !== null) commitPalette();
+    };
+    window.addEventListener("pointerup", commitNow);
+    window.addEventListener("blur", commitNow);
+    return () => {
+      window.removeEventListener("pointerup", commitNow);
+      window.removeEventListener("blur", commitNow);
+    };
+  }, [applyConfigLive, commitPalette]);
+
+  /** Forget a queued edit (used before a reset replaces it). */
+  const discardPendingPalette = () => {
+    clearPaletteTimers();
+    pendingPaletteRef.current = null;
   };
 
-  // Color pickers fire continuously while dragging; update local state
-  // immediately but send to the backend at most every ~200 ms.
+  // Color pickers fire continuously while dragging. Live-apply at most every
+  // ~200 ms with persist: false (in-memory only), then write the file once
+  // the edits settle — one disk write per gesture instead of ~5 per second.
   const applyPaletteColor = (entry: PaletteEntry, slot: number, hex: string) => {
     const colors = entry.palette.colors.map((c, i) => (i === slot ? hexToColor(hex) : c));
     const updated: PaletteEntry = {
@@ -548,19 +701,21 @@ function App() {
     setPalettes((ps) => ps.map((p) => (p.genre === entry.genre ? updated : p)));
     syncActivePalette(updated);
     if (pendingPaletteRef.current && pendingPaletteRef.current.genre !== entry.genre) {
-      flushPalette();
+      commitPalette();
     }
     pendingPaletteRef.current = updated;
     if (paletteSendTimer.current === null) {
       paletteSendTimer.current = window.setTimeout(() => {
         paletteSendTimer.current = null;
-        flushPalette();
+        if (pendingPaletteRef.current) sendPalette(pendingPaletteRef.current, false);
       }, 200);
     }
+    if (paletteCommitTimer.current !== null) clearTimeout(paletteCommitTimer.current);
+    paletteCommitTimer.current = window.setTimeout(commitPalette, 700);
   };
 
   const resetGenrePalette = async (genreId: string) => {
-    pendingPaletteRef.current = null;
+    discardPendingPalette();
     const p = await invoke<Palette>("reset_genre_palette", { genreId });
     const updated: PaletteEntry = { genre: genreId, palette: p };
     setPalettes((ps) => ps.map((e) => (e.genre === genreId ? updated : e)));
@@ -580,7 +735,7 @@ function App() {
       resetAllTimer.current = null;
     }
     setResetAllArmed(false);
-    pendingPaletteRef.current = null;
+    discardPendingPalette();
     const entries = await invoke<PaletteEntry[]>("reset_all_palettes");
     setPalettes(entries);
     const active = entries.find((e) => e.genre === activePaletteId);
@@ -699,14 +854,33 @@ function App() {
               </div>
               <p className="hint">
                 {config.analyzer.threshold_mode === "manual"
-                  ? "閾値は固定(音量変化に追従しません)。フェーダーで各帯域のレベルを直接設定 / 間隔: 連続発火を抑える最小時間"
+                  ? "閾値は固定(音量変化に追従しません)。メーターの黄ラインをドラッグ、または数値入力で直接設定(0 = 自動) / 間隔: 連続発火を抑える最小時間"
                   : "閾値: 低いほど敏感に発火 / 間隔: 同帯域の連続発火を抑える最小時間"}
               </p>
               {BANDS.map((b, i) => (
                 <div key={b} className="band-tune-row">
                   <span className="band-tune-label">{BAND_LABELS[b]}</span>
                   {config.analyzer.threshold_mode === "manual" ? (
-                    <span className="manual-note">閾値: フェーダーで調整</span>
+                    // Keyboard / screen-reader accessible equivalent of
+                    // dragging the meter's threshold line: the same raw flux
+                    // value, typed. 0 hands the band back to auto.
+                    <label>
+                      閾値 {config.analyzer.manual_threshold[i] > 0 ? "(raw)" : "(自動)"}
+                      <input
+                        type="number"
+                        min={0}
+                        step={manualStep(config.analyzer.manual_threshold[i])}
+                        value={config.analyzer.manual_threshold[i]}
+                        title="ビート検出閾値(raw flux 単位)。メーターの黄ラインのドラッグと同じ値です。0 で自動閾値に戻ります"
+                        onChange={(e) => {
+                          const manual_threshold = [...config.analyzer.manual_threshold] as [number, number, number, number];
+                          manual_threshold[i] = Math.max(0, Number(e.target.value) || 0);
+                          // Live path: held arrow keys shouldn't each write
+                          // config.toml.
+                          updateConfigLive({ analyzer: { ...config.analyzer, manual_threshold } });
+                        }}
+                      />
+                    </label>
                   ) : (
                     <label>
                       閾値 {config.analyzer.sensitivity[i].toFixed(1)}σ
@@ -719,7 +893,7 @@ function App() {
                         onChange={(e) => {
                           const sensitivity = [...config.analyzer.sensitivity] as [number, number, number, number];
                           sensitivity[i] = Number(e.target.value);
-                          updateConfig({ analyzer: { ...config.analyzer, sensitivity } });
+                          updateConfigLive({ analyzer: { ...config.analyzer, sensitivity } });
                         }}
                       />
                     </label>
@@ -735,7 +909,7 @@ function App() {
                       onChange={(e) => {
                         const min_interval_ms = [...config.analyzer.min_interval_ms] as [number, number, number, number];
                         min_interval_ms[i] = Number(e.target.value);
-                        updateConfig({ analyzer: { ...config.analyzer, min_interval_ms } });
+                        updateConfigLive({ analyzer: { ...config.analyzer, min_interval_ms } });
                       }}
                     />
                   </label>
@@ -884,6 +1058,9 @@ function App() {
                         type="color"
                         value={colorToHex(c)}
                         onChange={(e) => applyPaletteColor(editEntry, i, e.target.value)}
+                        // Closing the picker persists right away instead of
+                        // waiting out the settle timer.
+                        onBlur={commitPalette}
                       />
                       <span>{i < BANDS.length ? BAND_LABELS[BANDS[i]] : `#${i + 1}`}</span>
                     </label>
@@ -948,7 +1125,7 @@ function App() {
                   max={300}
                   step={10}
                   value={config.effects.chase_ms}
-                  onChange={(e) => updateConfig({ effects: { ...config.effects, chase_ms: Number(e.target.value) } })}
+                  onChange={(e) => updateConfigLive({ effects: { ...config.effects, chase_ms: Number(e.target.value) } })}
                 />
               </label>
               <label>
@@ -960,7 +1137,7 @@ function App() {
                   step={0.01}
                   value={config.effects.brightness_min}
                   onChange={(e) =>
-                    updateConfig({ effects: { ...config.effects, brightness_min: Number(e.target.value) } })
+                    updateConfigLive({ effects: { ...config.effects, brightness_min: Number(e.target.value) } })
                   }
                 />
               </label>
@@ -973,7 +1150,7 @@ function App() {
                   step={0.01}
                   value={config.effects.brightness_max}
                   onChange={(e) =>
-                    updateConfig({ effects: { ...config.effects, brightness_max: Number(e.target.value) } })
+                    updateConfigLive({ effects: { ...config.effects, brightness_max: Number(e.target.value) } })
                   }
                 />
               </label>
@@ -985,7 +1162,7 @@ function App() {
                   max={1200}
                   step={10}
                   value={config.effects.fade_ms}
-                  onChange={(e) => updateConfig({ effects: { ...config.effects, fade_ms: Number(e.target.value) } })}
+                  onChange={(e) => updateConfigLive({ effects: { ...config.effects, fade_ms: Number(e.target.value) } })}
                 />
               </label>
               <label>
@@ -997,7 +1174,7 @@ function App() {
                   step={0.05}
                   value={config.effects.per_light_probability}
                   onChange={(e) =>
-                    updateConfig({ effects: { ...config.effects, per_light_probability: Number(e.target.value) } })
+                    updateConfigLive({ effects: { ...config.effects, per_light_probability: Number(e.target.value) } })
                   }
                 />
               </label>

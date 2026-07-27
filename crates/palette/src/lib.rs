@@ -166,10 +166,13 @@ impl PaletteStore {
 mod tests {
     use super::*;
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("huebeat-palette-test-{name}")).join("palettes.toml")
+    }
+
     #[test]
     fn roundtrip() {
-        let dir = std::env::temp_dir().join("hue2-palette-test");
-        let path = dir.join("palettes.toml");
+        let path = temp_path("roundtrip");
         let mut store = PaletteStore::default();
         store.genre_map.insert(
             Genre::DeepHouse,
@@ -182,6 +185,66 @@ mod tests {
             loaded.palette_for(Genre::Hardcore).name,
             default_palette(Genre::Hardcore).name
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn every_genre_has_a_default_palette() {
+        for &g in Genre::ALL {
+            let p = default_palette(g);
+            assert_eq!(p.colors.len(), 4, "{g:?} needs one color per band");
+            assert!(!p.name.is_empty(), "{g:?} has no palette name");
+            // A store built from defaults must expose every genre, which is
+            // what the palette editor lists.
+            assert_eq!(PaletteStore::default().palette_for(g).name, p.name);
+        }
+    }
+
+    #[test]
+    fn reset_genre_restores_the_default() {
+        let mut store = PaletteStore::default();
+        let custom = pal("Mine", ["#010101", "#020202", "#030303", "#040404"]);
+        store.genre_map.insert(Genre::Techno, custom.clone());
+        assert_eq!(store.palette_for(Genre::Techno).name, "Mine");
+
+        let back = store.reset_genre(Genre::Techno);
+        assert_eq!(back.colors, default_palette(Genre::Techno).colors);
+        assert_eq!(store.palette_for(Genre::Techno).colors, back.colors);
+
+        // reset_all wipes every customization, not just the last one.
+        store.genre_map.insert(Genre::Techno, custom.clone());
+        store.genre_map.insert(Genre::Trap, custom);
+        store.reset_all();
+        for &g in Genre::ALL {
+            assert_eq!(store.palette_for(g).colors, default_palette(g).colors, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn load_ignores_unknown_genre_keys() {
+        let path = temp_path("unknown-keys");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r##"
+[genres.techno]
+name = "Custom Techno"
+colors = ["#111111", "#222222", "#333333", "#444444"]
+
+[genres.vaporwave_from_the_future]
+name = "Not A Genre Yet"
+colors = ["#555555"]
+"##,
+        )
+        .unwrap();
+        let loaded = PaletteStore::load(&path).unwrap();
+        assert_eq!(loaded.palette_for(Genre::Techno).name, "Custom Techno");
+        // Unknown keys are skipped without taking the rest of the file down,
+        // and untouched genres keep their built-in defaults.
+        assert_eq!(
+            loaded.palette_for(Genre::House).name,
+            default_palette(Genre::House).name
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

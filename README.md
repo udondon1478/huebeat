@@ -10,7 +10,7 @@ LightBeat の後継として、Hue **Entertainment API(DTLS/UDP, 50Hz)** ベー�
 - **ジャンル自動推定** — BPM × スペクトル特徴のルールベース分類で 27 ジャンル(House / Techno / Trance / Psytrance / Hardstyle / Eurobeat / DnB / Dubstep / Trap / Future Bass / Hip Hop / Reggaeton / Synthwave など)を判別し、カラーパレットを自動切替。Future Core / Jersey Club / Hyperflip / アニソンRemix / Net Pop といった日本のサブカルクラブシーン系ジャンルにも対応。将来 ONNX モデルに差替可能な設計
 - **カラーパレット編集** — ジャンルごとの4色(帯域対応)を UI から自由に変更・即時反映。ワンクリックで既定色に復元可能
 - **Hue Entertainment ストリーミング** — DTLS-PSK / 50Hz、サブ100msレイテンシ。REST v2(CLIP v2)でペアリング・エリア管理
-- **OSC 送信** — `/hue2/bpm` `/hue2/beat` `/hue2/genre` `/hue2/palette` `/hue2/intensity`
+- **OSC 送信** — `/hue2/bpm` `/hue2/beat` `/hue2/genre` `/hue2/palette` `/hue2/intensity`(アドレスは互換のため据え置き。[互換性メモ](#互換性メモ)参照)
 - **ライブ用パニック** — Blackout / White Flash / Freeze
 - **LightBeat 機能パリティ** — 輝度レンジ、フェード速度、ライト毎反応確率、低域のみ検出モード、Glow/Strobe、パレット編集、設定自動保存
 - 仮想ライトプレビュー(ブリッジなしでも動作確認可能)
@@ -61,6 +61,16 @@ cargo run -p diag -- <bridge_ip> <app_key> <client_key> <entertainment_config_id
 3. エンタメエリアを選択(Hue 公式アプリで事前作成)→「テストパターン」で疎通確認
 4. START — 音楽を再生すると BPM / ジャンル / パレットが追従
 5. OSC 送信先を設定すると Resolume / TouchDesigner 等と連携可能
+
+## 互換性メモ
+
+`huebeat` へのリブランド後も、次の識別子は **意図的に旧名 `hue2` のまま**にしています。
+
+- **アプリ識別子 `pw.hue2.app`**(`app/src-tauri/tauri.conf.json`) — これを変えると OS のアプリ設定ディレクトリが変わり、既存ユーザーの `config.toml`(ブリッジのペアリング情報を含む)と `palettes.toml` が参照されなくなります。
+- **OSC アドレス `/hue2/...`** — 変更すると Resolume / TouchDesigner 側の既存マッピングが全て壊れます。
+
+いずれも移行が必要になった場合は、設定ディレクトリのマイグレーションと OSC プレフィックスの設定項目化をセットで行う必要があります。
+なお、ジャンル自動推定の「27 ジャンル」は音楽ジャンルの数で、パレット一覧には `Ambient` と `Auto / Unknown` を加えた 29 項目が並びます(`Genre::ALL`)。
 
 ## ロードマップ
 

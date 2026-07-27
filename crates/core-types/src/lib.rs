@@ -1,4 +1,4 @@
-//! Shared types flowing through the hue2 pipeline:
+//! Shared types flowing through the huebeat pipeline:
 //! audio capture -> analysis -> (genre, effects) -> hue-stream / osc.
 
 use serde::{Deserialize, Serialize};
@@ -115,113 +115,73 @@ pub enum TempoSource {
     Osc,
 }
 
-/// Music genre families used for palette selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Genre {
-    DeepHouse,
-    House,
-    TechHouse,
-    ElectroHouse,
-    NuDisco,
-    NetPop,
-    UkGarage,
-    JerseyClub,
-    Techno,
-    Trance,
-    Psytrance,
-    Hardstyle,
-    Eurobeat,
-    AnisonRemix,
-    Breakbeat,
-    DrumAndBass,
-    Dubstep,
-    Trap,
-    Hyperflip,
-    FutureBass,
-    FutureCore,
-    Hardcore,
-    KawaiiFutureBass,
-    HipHop,
-    Rnb,
-    Reggaeton,
-    Synthwave,
-    Ambient,
-    Unknown,
+/// Declares the `Genre` enum together with `ALL`, `as_str`, `from_id` and
+/// the serde ids from one list, so a new genre cannot be half-added: the
+/// list is the only place to edit, and forgetting it in `ALL` (which used
+/// to compile fine and silently drop the genre from the palette UI and
+/// from `palettes.toml` loading) is no longer possible.
+macro_rules! genres {
+    ($($variant:ident => $id:literal),+ $(,)?) => {
+        /// Music genre families used for palette selection.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum Genre {
+            $(
+                #[serde(rename = $id)]
+                $variant,
+            )+
+        }
+
+        impl Genre {
+            /// Every genre, in display / palette-list order.
+            pub const ALL: &'static [Genre] = &[$(Genre::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Genre::$variant => $id,)+
+                }
+            }
+
+            /// Inverse of `as_str` (also matches the serde ids).
+            pub fn from_id(id: &str) -> Option<Genre> {
+                match id {
+                    $($id => Some(Genre::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
 }
 
-impl Genre {
-    /// Every genre, in display / palette-list order.
-    pub const ALL: [Genre; 29] = [
-        Genre::DeepHouse,
-        Genre::House,
-        Genre::TechHouse,
-        Genre::ElectroHouse,
-        Genre::NuDisco,
-        Genre::NetPop,
-        Genre::UkGarage,
-        Genre::JerseyClub,
-        Genre::Techno,
-        Genre::Trance,
-        Genre::Psytrance,
-        Genre::Hardstyle,
-        Genre::Eurobeat,
-        Genre::AnisonRemix,
-        Genre::Breakbeat,
-        Genre::DrumAndBass,
-        Genre::Dubstep,
-        Genre::Trap,
-        Genre::Hyperflip,
-        Genre::FutureBass,
-        Genre::FutureCore,
-        Genre::Hardcore,
-        Genre::KawaiiFutureBass,
-        Genre::HipHop,
-        Genre::Rnb,
-        Genre::Reggaeton,
-        Genre::Synthwave,
-        Genre::Ambient,
-        Genre::Unknown,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Genre::DeepHouse => "deep_house",
-            Genre::House => "house",
-            Genre::TechHouse => "tech_house",
-            Genre::ElectroHouse => "electro_house",
-            Genre::NuDisco => "nu_disco",
-            Genre::NetPop => "net_pop",
-            Genre::UkGarage => "uk_garage",
-            Genre::JerseyClub => "jersey_club",
-            Genre::Techno => "techno",
-            Genre::Trance => "trance",
-            Genre::Psytrance => "psytrance",
-            Genre::Hardstyle => "hardstyle",
-            Genre::Eurobeat => "eurobeat",
-            Genre::AnisonRemix => "anison_remix",
-            Genre::Breakbeat => "breakbeat",
-            Genre::DrumAndBass => "drum_and_bass",
-            Genre::Dubstep => "dubstep",
-            Genre::Trap => "trap",
-            Genre::Hyperflip => "hyperflip",
-            Genre::FutureBass => "future_bass",
-            Genre::FutureCore => "future_core",
-            Genre::Hardcore => "hardcore",
-            Genre::KawaiiFutureBass => "kawaii_future_bass",
-            Genre::HipHop => "hip_hop",
-            Genre::Rnb => "rnb",
-            Genre::Reggaeton => "reggaeton",
-            Genre::Synthwave => "synthwave",
-            Genre::Ambient => "ambient",
-            Genre::Unknown => "unknown",
-        }
-    }
-
-    /// Inverse of `as_str` (also matches the serde snake_case ids).
-    pub fn from_id(id: &str) -> Option<Genre> {
-        Self::ALL.iter().copied().find(|g| g.as_str() == id)
-    }
+genres! {
+    DeepHouse => "deep_house",
+    House => "house",
+    TechHouse => "tech_house",
+    ElectroHouse => "electro_house",
+    NuDisco => "nu_disco",
+    NetPop => "net_pop",
+    UkGarage => "uk_garage",
+    JerseyClub => "jersey_club",
+    Techno => "techno",
+    Trance => "trance",
+    Psytrance => "psytrance",
+    Hardstyle => "hardstyle",
+    Eurobeat => "eurobeat",
+    AnisonRemix => "anison_remix",
+    Breakbeat => "breakbeat",
+    DrumAndBass => "drum_and_bass",
+    Dubstep => "dubstep",
+    Trap => "trap",
+    Hyperflip => "hyperflip",
+    FutureBass => "future_bass",
+    FutureCore => "future_core",
+    Hardcore => "hardcore",
+    KawaiiFutureBass => "kawaii_future_bass",
+    HipHop => "hip_hop",
+    Rnb => "rnb",
+    Reggaeton => "reggaeton",
+    Synthwave => "synthwave",
+    Ambient => "ambient",
+    Unknown => "unknown",
 }
 
 /// sRGB color, 0..255.
@@ -302,4 +262,31 @@ pub enum EngineEvent {
     Tempo(TempoEstimate),
     GenreChanged { genre: Genre },
     PaletteChanged { palette: Palette },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL`, `as_str`, `from_id` and the serde id all come from one macro
+    /// list; this pins the contract the palette store and the UI rely on.
+    #[test]
+    fn genre_ids_roundtrip() {
+        for &g in Genre::ALL {
+            assert_eq!(Genre::from_id(g.as_str()), Some(g), "{g:?}");
+            let json = serde_json::to_string(&g).unwrap();
+            assert_eq!(json, format!("\"{}\"", g.as_str()), "{g:?}");
+            assert_eq!(serde_json::from_str::<Genre>(&json).unwrap(), g);
+        }
+        assert_eq!(Genre::from_id("not_a_genre"), None);
+    }
+
+    #[test]
+    fn genre_ids_are_unique() {
+        let mut ids: Vec<&str> = Genre::ALL.iter().map(|g| g.as_str()).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "duplicate genre id");
+    }
 }
